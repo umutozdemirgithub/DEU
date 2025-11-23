@@ -323,30 +323,45 @@ def _ensemble_anomaly_detector(resid, leverage, cooks_d):
       0 -> normal
     """
     n = len(resid)
+    # Hata önleyici: Eğer veri çok azsa direkt sıfır dön
+    if n < 2:
+        return np.zeros(n), np.zeros(n, dtype=int)
+        
     X_feat = np.vstack([resid, leverage, cooks_d]).T
     scaler = StandardScaler()
-    Xs = scaler.fit_transform(np.nan_to_num(X_feat))
+    # Nan kontrolü
+    X_feat = np.nan_to_num(X_feat)
+    
+    try:
+        Xs = scaler.fit_transform(X_feat)
+    except Exception:
+        Xs = X_feat # Fallback
 
     scores = np.zeros((n, 4))  # IF, LOF (neg), DBSCAN (outlier flag), 3sigma
-    # IsolationForest
+    
+    # 1. IsolationForest
     try:
         if_model = IsolationForest(n_estimators=200, contamination=0.05, random_state=42)
         if_pred = if_model.fit_predict(Xs)
         if_score = -if_model.score_samples(Xs)  # higher = more abnormal
-        scores[:,0] = (if_score - if_score.min()) / (if_score.ptp() + 1e-9)
+        # FIX: .ptp() yerine (max - min)
+        min_s, max_s = if_score.min(), if_score.max()
+        scores[:,0] = (if_score - min_s) / ((max_s - min_s) + 1e-9)
     except Exception:
         scores[:,0] = 0
 
-    # LOF
+    # 2. LOF
     try:
         lof = LocalOutlierFactor(n_neighbors=max(5, min(50, int(n/5))), contamination=0.05, novelty=False)
         lof_pred = lof.fit_predict(Xs)
         lof_score = -lof.negative_outlier_factor_  # higher = more abnormal
-        scores[:,1] = (lof_score - lof_score.min()) / (lof_score.ptp() + 1e-9)
+        # FIX: .ptp() yerine (max - min)
+        min_l, max_l = lof_score.min(), lof_score.max()
+        scores[:,1] = (lof_score - min_l) / ((max_l - min_l) + 1e-9)
     except Exception:
         scores[:,1] = 0
 
-    # DBSCAN
+    # 3. DBSCAN
     try:
         db = DBSCAN(eps=0.8, min_samples=5)
         db_labels = db.fit_predict(Xs)
@@ -355,16 +370,23 @@ def _ensemble_anomaly_detector(resid, leverage, cooks_d):
     except Exception:
         scores[:,2] = 0
 
-    # 3-sigma on residuals
+    # 4. 3-sigma on residuals
     sigma = np.std(resid)
-    three_sigma_flag = (np.abs(resid) > 3 * sigma).astype(float)
+    if sigma > 0:
+        three_sigma_flag = (np.abs(resid) > 3 * sigma).astype(float)
+    else:
+        three_sigma_flag = np.zeros(n)
     scores[:,3] = three_sigma_flag
 
-    # aggregate: weighted sum
+    # Aggregate: Weighted sum
     weights = np.array([0.4, 0.3, 0.15, 0.15])
     agg = scores.dot(weights)
-    # normalize
-    agg = (agg - agg.min()) / (agg.ptp() + 1e-9)
+    
+    # Normalize Aggregate
+    # FIX: .ptp() hatasını burada çözüyoruz
+    agg_min = agg.min()
+    agg_max = agg.max()
+    agg = (agg - agg_min) / ((agg_max - agg_min) + 1e-9)
 
     labels = np.zeros_like(agg, dtype=int)
     labels[agg >= 0.75] = 2  # strong
