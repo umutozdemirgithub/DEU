@@ -5,9 +5,10 @@ matplotlib
 plotly
 scikit-learn
 scipy
-shap
 statsmodels
+shap
+lime
 xgboost
 lightgbm
 catboost
-lime
+streamlit-plotly-events
