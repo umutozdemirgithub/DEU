@@ -4,870 +4,984 @@ import numpy as np
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import plotly.express as px
-from sklearn.model_selection import train_test_split, RandomizedSearchCV, GridSearchCV
-from sklearn.ensemble import HistGradientBoostingRegressor, IsolationForest
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, GridSearchCV, TimeSeriesSplit
+from sklearn.ensemble import HistGradientBoostingRegressor, IsolationForest, GradientBoostingRegressor, RandomForestRegressor
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler, MaxAbsScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error, median_absolute_error
+from sklearn.inspection import permutation_importance
 from scipy import stats
 import shap
 import streamlit.components.v1 as components
+import warnings
 
-# Page Configuration
-st.set_page_config(page_title="XAI Solar Forecasting", layout="wide")
+import statsmodels.api as sm
+from scipy.stats import gaussian_kde, probplot
+from scipy.stats import shapiro
+from io import BytesIO
+from matplotlib.backends.backend_pdf import PdfPages
+import time
 
-# --- SESSION STATE INITIALIZATION ---
-if 'res_store' not in st.session_state:
-    st.session_state['res_store'] = {}
-if 'trained' not in st.session_state:
-    st.session_state['trained'] = False
+# Optional / best-effort imports
+try:
+    from xgboost import XGBRegressor
+except Exception:
+    XGBRegressor = None
 
-# --- 1. HELPER FUNCTIONS ---
+try:
+    from lightgbm import LGBMRegressor
+except Exception:
+    LGBMRegressor = None
 
+try:
+    from catboost import CatBoostRegressor
+except Exception:
+    CatBoostRegressor = None
+
+try:
+    from lime import lime_tabular
+except Exception:
+    lime_tabular = None
+
+# Suppress warnings for cleaner UI
+warnings.filterwarnings("ignore")
+
+# -------------------------
+# Utilities
+# -------------------------
 def st_shap(plot, height=None):
-    """Helper function to display SHAP JS plots in Streamlit"""
+    """Helper to render shap plots in Streamlit (JS-based)."""
     shap_html = f"<head>{shap.getjs()}</head><body>{plot.html()}</body>"
     components.html(shap_html, height=height)
 
-def apply_outlier_handling(df, cols, methods):
-    df_clean = df.copy()
-    if "IQR Capping" in methods:
-        for col in cols:
-            Q1 = df_clean[col].quantile(0.25)
-            Q3 = df_clean[col].quantile(0.75)
-            IQR = Q3 - Q1
-            lower = Q1 - 1.5 * IQR
-            upper = Q3 + 1.5 * IQR
-            df_clean[col] = np.where(df_clean[col] < lower, lower, df_clean[col])
-            df_clean[col] = np.where(df_clean[col] > upper, upper, df_clean[col])
+def safe_model_factory(name, random_state=42):
+    if name == "HistGradientBoosting":
+        return HistGradientBoostingRegressor(random_state=random_state)
+    if name == "RandomForest":
+        return RandomForestRegressor(random_state=random_state)
+    if name == "GradientBoosting":
+        return GradientBoostingRegressor(random_state=random_state)
+    if name == "XGBoost":
+        if XGBRegressor is None: raise ImportError("XGBoost not installed")
+        return XGBRegressor(random_state=random_state, verbosity=0)
+    if name == "LightGBM":
+        if LGBMRegressor is None: raise ImportError("LightGBM not installed")
+        return LGBMRegressor(random_state=random_state, verbose=-1)
+    if name == "CatBoost":
+        if CatBoostRegressor is None: raise ImportError("CatBoost not installed")
+        return CatBoostRegressor(random_state=random_state, verbose=0)
+    return HistGradientBoostingRegressor(random_state=random_state)
 
-    if "Z-Score Capping" in methods:
-        for col in cols:
-            z = stats.zscore(df_clean[col])
-            mean_val = df_clean[col].mean()
-            std_val = df_clean[col].std()
-            upper = mean_val + 3 * std_val
-            lower = mean_val - 3 * std_val
-            df_clean[col] = np.where(df_clean[col] > upper, upper, df_clean[col])
-            df_clean[col] = np.where(df_clean[col] < lower, lower, df_clean[col])
-
-    if "Isolation Forest (Drop)" in methods:
-        iso = IsolationForest(contamination=0.05, random_state=42)
-        yhat = iso.fit_predict(df_clean[cols])
-        mask = yhat != -1
-        df_clean = df_clean[mask]
-    return df_clean
-
-def apply_scaling(df, cols, methods):
-    df_scaled = df.copy()
-    if "Log Transformation (np.log1p)" in methods:
-        for col in cols:
-            if (df_scaled[col] >= 0).all(): df_scaled[col] = np.log1p(df_scaled[col])
-    if "Min-Max Scaling (0-1)" in methods:
-        df_scaled[cols] = MinMaxScaler().fit_transform(df_scaled[cols])
-    if "Standard Scaling (Z-Score)" in methods:
-        df_scaled[cols] = StandardScaler().fit_transform(df_scaled[cols])
-    if "Robust Scaling (IQR based)" in methods:
-        df_scaled[cols] = RobustScaler().fit_transform(df_scaled[cols])
-    if "MaxAbs Scaling (-1 to 1)" in methods:
-        df_scaled[cols] = MaxAbsScaler().fit_transform(df_scaled[cols])
-    return df_scaled
-
-def perform_hpo(X_train, y_train, method):
-    base_model = HistGradientBoostingRegressor(random_state=42)
+# -------------------------
+# HPO Logic (FIXED: Time Series Awareness)
+# -------------------------
+def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False):
+    base_model = safe_model_factory(model_name)
+    random_space = {}
+    grid_space = {}
     
-    # --- ZENGİNLEŞTİRİLMİŞ PARAMETRE UZAYLARI ---
-    
-    # Random Search için Olasılık Dağılımları (Daha geniş ve esnek)
-    random_space = {
-        'learning_rate': stats.loguniform(0.001, 0.5),  # Logaritmik dağılım (önemli)
-        'max_iter': stats.randint(100, 1000),           # Ağaç sayısı
-        'max_leaf_nodes': stats.randint(15, 127),       # Ağaç karmaşıklığı
-        'max_depth': [None, 5, 10, 20, 30],             # Derinlik sınırı
-        'min_samples_leaf': stats.randint(10, 100),     # Yaprak başına min örnek (Overfitting önler)
-        'l2_regularization': stats.uniform(0.0, 10.0),  # L2 Regularizasyon
-        'max_bins': [50, 100, 255]                      # Veri ayrıştırma hassasiyeti
-    }
-    
-    # Grid Search için Sabit Listeler (Kombinasyon sayısı kontrollü tutuldu)
-    grid_space = {
-        'learning_rate': [0.01, 0.05, 0.1, 0.2],
-        'max_iter': [200, 500, 1000],
-        'max_leaf_nodes': [31, 63],
-        'max_depth': [None, 10, 20],
-        'min_samples_leaf': [20, 50],
-        'l2_regularization': [0.0, 0.1, 1.0]
-    }
+    # CV Stratejisi Belirleme (FIXED: Time Series Leakage Prevention)
+    if use_timesplit:
+        # Zaman serisi için özel split (Shuffle yok)
+        cv_strategy = TimeSeriesSplit(n_splits=3)
+    else:
+        # Standart 3-fold
+        cv_strategy = 3
 
-    if method == "Random Search":
-        # n_iter artırıldı (10 -> 30) daha fazla deneme yapması için
-        search = RandomizedSearchCV(
-            base_model, random_space, n_iter=30, cv=3, 
-            scoring='neg_mean_squared_error', random_state=42, n_jobs=-1
-        )
-    elif method == "Grid Search":
-        search = GridSearchCV(
-            base_model, grid_space, cv=3, 
-            scoring='neg_mean_squared_error', n_jobs=-1
-        )
+    # 1. HistGradientBoosting & GradientBoosting
+    if model_name in ["HistGradientBoosting", "GradientBoosting"]:
+        
+        # HistGradientBoosting için daha geniş ve "Default"u kapsayan bir arama uzayı
+        if model_name == "HistGradientBoosting":
+            random_space = {
+                # Learning rate'i çok düşürürsen iterasyonu artırman gerekir. 
+                # Loguniform ile 0.01 ile 0.3 arasında dengeli arama yapıyoruz.
+                'learning_rate': stats.loguniform(0.01, 0.5), 
+                
+                # Default max_iter 100'dür. HPO'nun daha fazlasını denemesine izin verelim.
+                'max_iter': stats.randint(100, 1000),
+                
+                # Max depth None (sınırsız) genellikle iyidir ama overfitting yaratabilir.
+                # Hem sığ (3-5) hem derin (10-20) hem de None denetelim.
+                'max_depth': [None, 3, 5, 10, 20],
+                
+                # Yaprak başına minimum örnek sayısı genelleme için kritiktir.
+                'min_samples_leaf': stats.randint(20, 100),
+                
+                # ÖNEMLİ EKLEME: Regularization (L2). Overfitting'i engeller.
+                'l2_regularization': stats.loguniform(1e-9, 10) 
+            }
+        else:
+            # Standart GradientBoosting (daha yavaştır, max_iter düşük tutulmalı)
+            random_space = {
+                'learning_rate': stats.loguniform(0.01, 0.3),
+                'n_estimators': stats.randint(100, 300), # GB'de max_iter yerine n_estimators kullanılır
+                'max_depth': [3, 5, 8],
+                'min_samples_leaf': stats.randint(20, 50)
+            }
+
+        # Grid Search Uzayı (Küçük ama etkili kombinasyonlar)
+        grid_space = {
+            'learning_rate': [0.01, 0.05, 0.1], 
+            'max_iter': [100, 300, 500] if model_name=="HistGradientBoosting" else [100, 200],
+            'max_depth': [None, 5, 10] if model_name=="HistGradientBoosting" else [3, 5],
+            'l2_regularization': [0, 1.0] if model_name=="HistGradientBoosting" else [0] # Sadece HistGB için
+        }
+
+    # 2. RandomForest
+    elif model_name == "RandomForest":
+        random_space = {
+            'n_estimators': stats.randint(50, 300), 
+            'max_depth': stats.randint(3, 20),
+            'min_samples_split': stats.randint(2, 10)
+        }
+        grid_space = {
+            'n_estimators': [100, 200], 
+            'max_depth': [5, 10, None]
+        }
+
+    # 3. CatBoost
+    elif model_name == "CatBoost":
+        random_space = {
+            'depth': stats.randint(4, 10), 
+            'learning_rate': stats.loguniform(0.01, 0.3), 
+            'iterations': stats.randint(100, 500),
+            'l2_leaf_reg': stats.randint(1, 10)
+        }
+        grid_space = {
+            'depth': [6, 8], 
+            'learning_rate': [0.03, 0.1],
+            'iterations': [200]
+        }
+    
+    # 4. XGBoost
+    elif model_name == "XGBoost":
+        random_space = {
+            'n_estimators': stats.randint(100, 500),
+            'max_depth': stats.randint(3, 10),
+            'learning_rate': stats.loguniform(0.01, 0.3),
+            'subsample': stats.uniform(0.5, 0.5),
+            'colsample_bytree': stats.uniform(0.5, 0.5)
+        }
+        grid_space = {
+            'n_estimators': [100, 300],
+            'max_depth': [3, 6],
+            'learning_rate': [0.01, 0.1]
+        }
+
+    # 5. LightGBM
+    elif model_name == "LightGBM":
+        random_space = {
+            'n_estimators': stats.randint(100, 500),
+            'learning_rate': stats.loguniform(0.01, 0.3),
+            'num_leaves': stats.randint(20, 100),
+            'max_depth': stats.randint(-1, 15)
+        }
+        grid_space = {
+            'n_estimators': [100, 300],
+            'learning_rate': [0.01, 0.1],
+            'num_leaves': [31, 50]
+        }
+
+    # HPO Uygulama
+    if method == "Random Search" and random_space:
+        st.write(f"⚙️ Tuning {model_name} with Random Search ({'TimeSeries' if use_timesplit else 'KFold'})...")
+        search = RandomizedSearchCV(base_model, random_space, n_iter=30, cv=cv_strategy, scoring='neg_mean_squared_error', random_state=42, n_jobs=-1)
+        search.fit(X_train, y_train)
+        return search.best_estimator_
+        
+    elif method == "Grid Search" and grid_space:
+        st.write(f"⚙️ Tuning {model_name} with Grid Search ({'TimeSeries' if use_timesplit else 'KFold'})...")
+        search = GridSearchCV(base_model, grid_space, cv=cv_strategy, scoring='neg_mean_squared_error', n_jobs=-1)
+        search.fit(X_train, y_train)
+        return search.best_estimator_
+    
     else:
         return base_model
 
-    with st.spinner(f"Optimizing ({method})... This may take a moment."):
-        search.fit(X_train, y_train)
-        
-    return search.best_estimator_
-
-
-def train_and_evaluate(X, y, test_size, hpo_method=None):
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
-    if hpo_method: model = perform_hpo(X_train, y_train, hpo_method)
-    else: 
-        model = HistGradientBoostingRegressor(random_state=42)
-        model.fit(X_train, y_train)
+# -------------------------
+# Training & evaluation (FIXED: Data Leakage Prevention)
+# -------------------------
+def train_and_evaluate(X, y, test_size, model_name, hpo_method=None, use_timesplit=False, 
+                       progress_callback=None, active_metrics=None, 
+                       outlier_methods=None, scaling_methods=None):
     
+    # 1. SPLIT (Önce ayır, sonra işlem yap -> Leakage Fix)
+    if use_timesplit:
+        tss = int(len(X)*(1-test_size))
+        X_train, X_test = X.iloc[:tss].copy(), X.iloc[tss:].copy()
+        y_train, y_test = y.iloc[:tss].copy(), y.iloc[tss:].copy()
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, shuffle=False)
+        X_train, X_test = X_train.copy(), X_test.copy()
+        y_train, y_test = y_train.copy(), y_test.copy()
+
+    # 2. OUTLIER HANDLING (Sadece Train verisine uygulanır)
+    if outlier_methods:
+        # Outlier temizliği için geçici birleşme (sadece X_train ve y_train için)
+        train_df = pd.concat([X_train, y_train], axis=1)
+        target_col_name = y_train.name
+        feature_cols = X_train.columns.tolist()
+        
+        # Temizlik
+        df_clean = train_df.copy()
+        cols_to_check = feature_cols # Genellikle featurelarda aranır
+        
+        if "IQR Capping" in outlier_methods:
+            for col in cols_to_check:
+                Q1 = df_clean[col].quantile(0.25)
+                Q3 = df_clean[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower = Q1 - 1.5 * IQR
+                upper = Q3 + 1.5 * IQR
+                df_clean[col] = np.where(df_clean[col] < lower, lower, df_clean[col])
+                df_clean[col] = np.where(df_clean[col] > upper, upper, df_clean[col])
+
+        if "Z-Score Capping" in outlier_methods:
+            for col in cols_to_check:
+                mean_val = df_clean[col].mean()
+                std_val = df_clean[col].std()
+                upper = mean_val + 3 * std_val
+                lower = mean_val - 3 * std_val
+                df_clean[col] = np.where(df_clean[col] > upper, upper, df_clean[col])
+                df_clean[col] = np.where(df_clean[col] < lower, lower, df_clean[col])
+
+        if "Isolation Forest (Drop)" in outlier_methods:
+            iso = IsolationForest(contamination=0.05, random_state=42)
+            yhat = iso.fit_predict(df_clean[feature_cols])
+            mask = yhat != -1
+            df_clean = df_clean[mask]
+
+        # Temizlenmiş veriyi geri ayır
+        X_train = df_clean[feature_cols]
+        y_train = df_clean[target_col_name]
+
+    # 3. SCALING (Train fit -> Train transform -> Test transform)
+    if scaling_methods:
+        cols_to_scale = X_train.columns.tolist()
+        
+        # Çoklu seçim olabilir, sırayla uygular (Genelde tek bir scaler seçilmesi önerilir ama yapı destekler)
+        if "Log Transformation (np.log1p)" in scaling_methods:
+            for col in cols_to_scale:
+                if (X_train[col] >= 0).all() and (X_test[col] >= 0).all():
+                    X_train[col] = np.log1p(X_train[col])
+                    X_test[col] = np.log1p(X_test[col])
+        
+        scaler = None
+        if "Min-Max Scaling (0-1)" in scaling_methods:
+            scaler = MinMaxScaler()
+        elif "Standard Scaling (Z-Score)" in scaling_methods:
+            scaler = StandardScaler()
+        elif "Robust Scaling (IQR based)" in scaling_methods:
+            scaler = RobustScaler()
+        elif "MaxAbs Scaling (-1 to 1)" in scaling_methods:
+            scaler = MaxAbsScaler()
+            
+        if scaler:
+            # Sadece Train üzerine FIT
+            X_train[cols_to_scale] = scaler.fit_transform(X_train[cols_to_scale])
+            # Test üzerine TRANSFORM (Sızıntı yok)
+            X_test[cols_to_scale] = scaler.transform(X_test[cols_to_scale])
+
+    # 4. MODEL TRAINING / HPO
+    if hpo_method:
+        # HPO fonksiyonuna use_timesplit bilgisini de gönderiyoruz
+        model = perform_hpo(X_train, y_train, hpo_method, model_name, use_timesplit=use_timesplit)
+    else:
+        model = safe_model_factory(model_name)
+        model.fit(X_train, y_train)
+
+    # Progress simulation
+    if progress_callback:
+        for p in [20,50,80,100]:
+            progress_callback(p)
+            time.sleep(0.01)
+
+    # 5. PREDICTION & METRICS
     y_pred = model.predict(X_test)
-    mse = mean_squared_error(y_test, y_pred)
-    metrics = {
-        'RMSE': np.sqrt(mse),
-        'MAE': mean_absolute_error(y_test, y_pred),
-        'R2': r2_score(y_test, y_pred),
-        'MSE': mse
-    }
+    
+    metrics = {}
+    if active_metrics is None: 
+        active_metrics = ["RMSE", "MAE", "R2"]
+
+    if "MSE" in active_metrics or "RMSE" in active_metrics:
+        mse_val = mean_squared_error(y_test, y_pred)
+        if "MSE" in active_metrics: metrics['MSE'] = mse_val
+        if "RMSE" in active_metrics: metrics['RMSE'] = np.sqrt(mse_val)
+    if "MAE" in active_metrics:
+        metrics['MAE'] = mean_absolute_error(y_test, y_pred)
+    if "R2" in active_metrics:
+        metrics['R2'] = r2_score(y_test, y_pred)
+    if "MAPE" in active_metrics:
+        metrics['MAPE'] = mean_absolute_percentage_error(y_test, y_pred)
+    if "MedAE" in active_metrics:
+        metrics['MedAE'] = median_absolute_error(y_test, y_pred)
+
     return metrics, model, X_train, X_test, y_test, y_pred
 
-# --- 2. MAIN UI ---
+# -------------------------
+# Diagnostics & Visuals
+# -------------------------
+def display_forecast_plots(y_test, y_pred, scenario_name, key_prefix="forecast"):
+    df_viz = pd.DataFrame({'Actual': y_test, 'Predicted': y_pred}, index=y_test.index)
+    df_viz = df_viz.sort_index()
+    limit = min(120, len(df_viz))
+    df_viz_subset = df_viz.head(limit)
+    fig_f = go.Figure()
+    fig_f.add_trace(go.Scatter(x=df_viz_subset.index, y=df_viz_subset['Actual'], name="Actual", mode='lines', line=dict(width=2)))
+    fig_f.add_trace(go.Scatter(x=df_viz_subset.index, y=df_viz_subset['Predicted'], name="Predicted", mode='lines', line=dict(width=2, dash='dot')))
+    fig_f.update_layout(title=f"Actual vs Predicted (first {limit} points)", template="plotly_white", height=420)
+    st.plotly_chart(fig_f, use_container_width=True, key=f"{key_prefix}_{scenario_name}")
 
-st.title("☀️ Explainable AI Assisted Solar Energy Forecasting")
-st.markdown("**Based on the research:** *Explainable Artificial Intelligence Assisted Solar Energy Forecasting*")
+def display_diagnostic_plots(y_test, y_pred, key_prefix="diag"):
+    st.markdown("## 🔍 Model Diagnostic Suite (Advanced)")
+    resid = np.array(y_test) - np.array(y_pred)
+    std_resid = (resid - np.mean(resid)) / np.std(resid)
+    # Influence
+    try:
+        X = sm.add_constant(pd.Series(np.array(y_pred)))
+        model = sm.OLS(pd.Series(np.array(y_test)), X).fit()
+        influence = model.get_influence()
+        leverage = influence.hat_matrix_diag
+        cooks_d = influence.cooks_distance[0]
+    except Exception:
+        leverage = np.zeros_like(resid)
+        cooks_d = np.zeros_like(resid)
 
-# --- SIDEBAR INPUTS ---
-st.sidebar.header("1. Data Input")
-uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+    tabs = st.tabs(["Residuals","Distribution","QQ","Std Resid","Influence"])
+    with tabs[0]:
+        lowess = sm.nonparametric.lowess(resid, y_pred, frac=0.3)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=y_pred, y=resid, mode='markers'))
+        fig.add_hline(y=0, line_dash='dash')
+        fig.add_trace(go.Scatter(x=lowess[:,0], y=lowess[:,1], mode='lines', line=dict(width=3)))
+        fig.update_layout(template='plotly_white', height=360)
+        st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_resid")
 
+    with tabs[1]:
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=resid, nbinsx=40, opacity=0.7))
+        try:
+            kde = gaussian_kde(resid)
+            x_vals = np.linspace(resid.min(), resid.max(), 200)
+            fig.add_trace(go.Scatter(x=x_vals, y=kde(x_vals)*len(resid)*(resid.max()-resid.min())/40, mode='lines'))
+        except Exception:
+            pass
+        fig.update_layout(template='plotly_white', height=360)
+        st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_dist")
+
+    with tabs[2]:
+        qq = probplot(resid, dist='norm')
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=qq[0][0], y=qq[0][1], mode='markers'))
+        fig.add_trace(go.Scatter(x=qq[0][0], y=qq[0][0], mode='lines'))
+        fig.update_layout(template='plotly_white', height=360)
+        st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_qq")
+        
+    with tabs[3]:
+        fig = px.scatter(x=y_pred, y=std_resid, labels={'x':'Predicted','y':'Std Residuals'})
+        fig.add_hline(y=0, line_dash='dash')
+        fig.add_hline(y=3, line_dash='dot', line_color='red')
+        fig.add_hline(y=-3, line_dash='dot', line_color='red')
+        fig.update_layout(template='plotly_white', height=360)
+        st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_std_resid")
+        
+    with tabs[4]:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=leverage, y=cooks_d, mode='markers'))
+        fig.update_layout(template='plotly_white', height=360)
+        st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_influence")
+
+def interpret_model_diagnostics(y_test, y_pred):
+    resid = np.array(y_test) - np.array(y_pred)
+    resid_mean = float(np.mean(resid))
+    resid_std = float(np.std(resid))
+    hetero_corr = float(np.corrcoef(resid, y_pred)[0,1]) if len(resid)>1 else 0.0
+    outlier_ratio = float(np.sum(np.abs(resid)>3*resid_std)/len(resid)) if resid_std>0 else 0.0
+    try:
+        _, p_value = shapiro(resid) if len(resid)>=3 else (None,1.0)
+    except Exception:
+        p_value=1.0
+    trend_corr = float(np.corrcoef(np.arange(len(resid)), np.sort(resid))[0,1]) if len(resid)>1 else 0.0
+
+    # Cards
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("Residual Mean", f"{resid_mean:.4f}")
+    c2.metric("Residual Std", f"{resid_std:.4f}")
+    c3.metric("Hetero Corr", f"{hetero_corr:.3f}")
+    c4.metric("Outlier Ratio", f"{outlier_ratio*100:.2f}%")
+    c5.metric("Shapiro p", f"{p_value:.3f}")
+
+    # Summary
+    def label(cond): return "✔" if cond=="good" else ("⚠" if cond=="warn" else "❌")
+    bias = "good" if abs(resid_mean)<resid_std*0.05 else ("warn" if abs(resid_mean)<resid_std*0.15 else "bad")
+    hetero = "good" if abs(hetero_corr)<0.15 else ("warn" if abs(hetero_corr)<0.35 else "bad")
+    normal = "good" if p_value>0.05 else "warn"
+    outl = "good" if outlier_ratio<0.01 else ("warn" if outlier_ratio<0.05 else "bad")
+    trend = "good" if abs(trend_corr)<0.15 else "warn"
+
+    st.markdown("### 🧩 Summary")
+    st.markdown(f"**Bias:** {label(bias)}  |  **Heteroskedasticity:** {label(hetero)}  |  **Normality:** {label(normal)}  |  **Outliers:** {label(outl)}  |  **Trend:** {label(trend)}")
+
+    stats_df = pd.DataFrame({"Metric":["Resid Mean","Resid Std","Hetero Corr","Outlier Ratio","Shapiro p","Trend Corr"],"Value":[resid_mean,resid_std,hetero_corr,outlier_ratio,p_value,trend_corr]})
+    st.dataframe(stats_df, use_container_width=True)
+
+    return {"resid":resid, "mean":resid_mean, "std":resid_std, "hetero":hetero_corr, "outlier_ratio":outlier_ratio, "p_value":p_value, "trend":trend_corr}
+
+# XAI (SHAP/PFI/LIME) - kept robust
+def run_xai_analysis(model, X_train, X_test, y_test, y_pred, methods, key_suffix):
+    if not methods:
+        st.info("No XAI methods selected.")
+        return
+
+    xai_tabs = st.tabs(methods)
+
+    # ----- SHAP -----
+    if "SHAP" in methods:
+        with xai_tabs[methods.index("SHAP")]:
+            st.info("Computing SHAP (Tree explainer preferred)")
+            try:
+                explainer = shap.TreeExplainer(model)
+                shap_values = explainer.shap_values(X_test) if hasattr(explainer, 'shap_values') else explainer(X_test)
+                
+                # Summary plot
+                fig, ax = plt.subplots(figsize=(6, 4))
+                shap.summary_plot(shap_values, X_test, show=False)
+                st.pyplot(fig)
+            except Exception as e:
+                st.warning(f"SHAP failed: {e}")
+
+    # ----- PFI -----
+    if "PFI" in methods:
+        with xai_tabs[methods.index("PFI")]:
+            st.info("Permutation Feature Importance")
+            try:
+                r_pfi = permutation_importance(model, X_test, y_test, n_repeats=8, random_state=42, n_jobs=-1)
+                idx = r_pfi.importances_mean.argsort()[::-1]
+                pfi_df = pd.DataFrame({
+                    "Feature": X_test.columns[idx],
+                    "Importance": r_pfi.importances_mean[idx]
+                })
+                
+                fig = px.bar(pfi_df, x='Importance', y='Feature', orientation='h', height=400)
+                st.plotly_chart(fig, use_container_width=True, key=f'pfi_chart_{key_suffix}')
+                st.dataframe(pfi_df, use_container_width=True, key=f'pfi_df_{key_suffix}')
+            except Exception as e:
+                st.error(f"PFI error: {e}")
+
+    # ----- LIME -----
+    if "LIME" in methods:
+        with xai_tabs[methods.index("LIME")]:
+            if lime_tabular is None:
+                st.warning("LIME not installed.")
+            else:
+                st.info("Generating LIME explanation for a selected instance")
+                idx = st.number_input(
+                    "Instance index", 
+                    min_value=0, 
+                    max_value=max(0, len(X_test) - 1), 
+                    value=0, 
+                    key=f'lime_idx_{key_suffix}'
+                )
+
+                explainer = lime_tabular.LimeTabularExplainer(
+                    X_train.values, 
+                    feature_names=X_train.columns, 
+                    mode='regression'
+                )
+                exp = explainer.explain_instance(
+                    X_test.iloc[idx].values,
+                    lambda x: model.predict(pd.DataFrame(x, columns=X_train.columns)),
+                    num_features=10
+                )
+                
+                components.html(exp.as_html(), height=500, scrolling=True)
+
+# -------------------------
+# PDF Report generator
+# -------------------------
+def generate_pdf_report(results):
+    buf = BytesIO()
+    plt.ioff() 
+    
+    with PdfPages(buf) as pdf:
+        # 1. Leaderboard
+        fig_table, ax_table = plt.subplots(figsize=(11.69, 8.27)) 
+        ax_table.axis('off')
+        ax_table.set_title("Model Leaderboard & Summary", fontsize=16, fontweight='bold', y=1.02)
+        
+        dfm = pd.DataFrame([{**{'Scenario':k}, **v['metrics']} for k,v in results.items()])
+        numeric_cols = dfm.select_dtypes(include=[np.number]).columns
+        dfm[numeric_cols] = dfm[numeric_cols].round(4)
+        
+        table = ax_table.table(cellText=dfm.values, colLabels=dfm.columns, loc='center', cellLoc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1, 1.5)
+        
+        pdf.savefig(fig_table, bbox_inches='tight')
+        plt.close(fig_table)
+
+        # 2. Leaderboard Chart
+        fig_chart, ax_chart = plt.subplots(figsize=(11.69, 8.27))
+        
+        bar_width = 0.2
+        index = np.arange(len(dfm))
+        colors = plt.cm.Pastel1.colors 
+        color_idx = 0
+        
+        for metric in numeric_cols:
+            if metric != 'R2':
+                ax_chart.bar(index + color_idx*bar_width, dfm[metric], bar_width, label=metric, color=colors[color_idx % len(colors)])
+                color_idx += 1
+        
+        if 'R2' in numeric_cols:
+            ax_chart.plot(index + bar_width, dfm['R2'], color='crimson', marker='o', linestyle='--', linewidth=2, label='R2')
+        
+        ax_chart.set_xticks(index + bar_width*(color_idx-1)/2)
+        ax_chart.set_xticklabels(dfm['Scenario'], rotation=45, ha='right')
+        ax_chart.set_ylabel("Score")
+        ax_chart.set_title("Leaderboard Metrics & R2", fontsize=14, fontweight='bold')
+        ax_chart.legend()
+        ax_chart.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        pdf.savefig(fig_chart, bbox_inches='tight')
+        plt.close(fig_chart)
+
+        # 3. Individual Scenarios
+        for scenario_name, res in results.items():
+            model = res['model']
+            X_test = res['Xte']
+            y_test = res['yte']
+            y_pred = res['ypr']
+            metrics = res['metrics']
+            resid = y_test - y_pred
+
+            fig_perf, axs = plt.subplots(3, 1, figsize=(8.27, 11.69))
+            fig_perf.suptitle(f"Performance: {scenario_name}", fontsize=14, fontweight='bold')
+
+            limit = min(300, len(y_test))
+            axs[0].plot(y_test.index[:limit], y_test[:limit], label='Actual', color='black', linewidth=1.5)
+            axs[0].plot(y_test.index[:limit], y_pred[:limit], label='Predicted', color='blue', linestyle='--', alpha=0.7)
+            axs[0].set_title(f"Forecast (First {limit} points)")
+            axs[0].legend()
+            axs[0].grid(True, alpha=0.3)
+
+            axs[1].scatter(y_pred, resid, alpha=0.5, color='purple', s=10)
+            axs[1].axhline(0, color='red', linestyle='--', linewidth=1)
+            axs[1].set_xlabel("Predicted")
+            axs[1].set_ylabel("Residuals")
+            axs[1].set_title("Residual Analysis")
+            axs[1].grid(True, alpha=0.3)
+
+            axs[2].hist(resid, bins=30, color='green', edgecolor='black', alpha=0.7)
+            axs[2].set_title("Error Distribution")
+            
+            stats_text = " | ".join([f"{k}: {v:.4f}" for k,v in metrics.items()])
+            fig_perf.text(0.5, 0.02, stats_text, ha='center', fontsize=12, bbox=dict(facecolor='lightgrey', alpha=0.5))
+            
+            plt.subplots_adjust(top=0.92, bottom=0.1, hspace=0.4)
+            pdf.savefig(fig_perf)
+            plt.close(fig_perf)
+
+            fig_xai = plt.figure(figsize=(8.27, 11.69))
+            fig_xai.suptitle(f"XAI Analysis: {scenario_name}", fontsize=14, fontweight='bold')
+            
+            gs = fig_xai.add_gridspec(2, 1, hspace=0.3)
+            ax_imp = fig_xai.add_subplot(gs[0])
+            
+            try:
+                if hasattr(model, 'feature_importances_'):
+                    importances = model.feature_importances_
+                    indices = np.argsort(importances)[-10:] 
+                    ax_imp.barh(range(len(indices)), importances[indices], align='center', color='teal')
+                    ax_imp.set_yticks(range(len(indices)))
+                    ax_imp.set_yticklabels([X_test.columns[i] for i in indices])
+                    ax_imp.set_title("Top 10 Feature Importances (Built-in)")
+                else:
+                    r_pfi = permutation_importance(model, X_test, y_test, n_repeats=5, random_state=42, n_jobs=-1)
+                    idx = r_pfi.importances_mean.argsort()[-10:]
+                    ax_imp.barh(range(len(idx)), r_pfi.importances_mean[idx], align='center', color='orange')
+                    ax_imp.set_yticks(range(len(idx)))
+                    ax_imp.set_yticklabels([X_test.columns[i] for i in idx])
+                    ax_imp.set_title("Top 10 Feature Importances (Permutation)")
+            except Exception as e:
+                ax_imp.text(0.5, 0.5, f"Feature Importance Error: {str(e)}", ha='center')
+
+            ax_shap = fig_xai.add_subplot(gs[1])
+            ax_shap.set_title("SHAP Summary Plot (Top Interactions)")
+            
+            try:
+                sample_size = min(100, len(X_test))
+                X_sample = X_test.iloc[:sample_size]
+                
+                explainer = None
+                shap_values = None
+                
+                try:
+                    explainer = shap.TreeExplainer(model)
+                    shap_values = explainer.shap_values(X_sample)
+                except:
+                    pass
+
+                if shap_values is not None:
+                    if isinstance(shap_values, list):
+                        shap_values = shap_values[0] 
+                    
+                    plt.sca(ax_shap) 
+                    shap.summary_plot(shap_values, X_sample, show=False, plot_size=None, color_bar=False)
+                else:
+                    ax_shap.text(0.5, 0.5, "SHAP Explainer not compatible or too slow.", ha='center')
+
+            except Exception as e:
+                ax_shap.text(0.5, 0.5, f"SHAP Error: {str(e)}", ha='center')
+
+            pdf.savefig(fig_xai)
+            plt.close(fig_xai)
+
+    buf.seek(0)
+    return buf.read()
+
+def display_leaderboard(results: dict) -> pd.DataFrame:
+    df_results = pd.DataFrame([{**{'Scenario': k}, **v['metrics']} for k, v in results.items()])
+    numeric_cols = df_results.select_dtypes(include=['float', 'int']).columns.tolist()
+    
+    with st.expander("### 🏆 Model Leaderboard", expanded=False):
+        tabs = st.tabs(["📊 Table", "📈 Chart", "⚙️ Parameters"])
+        
+        with tabs[0]:
+            st.dataframe(
+                df_results.style.format(formatter="{:.4f}", subset=numeric_cols),
+                use_container_width=True
+            )
+        
+        with tabs[1]:
+            import plotly.express as px
+            import plotly.graph_objects as go
+
+            fig = go.Figure()
+            colors = px.colors.qualitative.Pastel
+            color_idx = 0
+            
+            for metric in numeric_cols:
+                if metric != 'R2':
+                    fig.add_trace(
+                        go.Bar(
+                            x=df_results['Scenario'],
+                            y=df_results[metric],
+                            name=metric,
+                            text=df_results[metric].round(4),
+                            textposition='outside',
+                            marker_color=colors[color_idx % len(colors)]
+                        )
+                    )
+                    color_idx += 1
+            
+            if 'R2' in numeric_cols:
+                fig.add_trace(
+                    go.Scatter(
+                        x=df_results['Scenario'],
+                        y=df_results['R2'],
+                        mode='lines+markers',
+                        name='R2',
+                        line=dict(dash='dash', color='crimson', width=3),
+                        marker=dict(size=10, color='crimson'),
+                        text=df_results['R2'].round(4),
+                        textposition='top center'
+                    )
+                )
+            
+            fig.update_layout(
+                title="Leaderboard - All Metrics & R2",
+                yaxis=dict(title="Score"),
+                xaxis=dict(title="Model"),
+                barmode='group',
+                uniformtext_minsize=8,
+                uniformtext_mode='hide',
+                legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+
+        with tabs[2]:
+            st.markdown("#### ⚙️ Model Hyperparameters Configuration")
+            param_list = []
+            
+            for name, res in results.items():
+                model_obj = res['model']
+                try:
+                    params = model_obj.get_params()
+                except Exception:
+                    params = {"info": str(model_obj)}
+                
+                clean_params = {'Scenario': name}
+                for k, v in params.items():
+                    clean_params[k] = str(v) if not isinstance(v, (int, float, str, bool, type(None))) else v
+                
+                param_list.append(clean_params)
+            
+            if param_list:
+                df_params = pd.DataFrame(param_list)
+                cols = ['Scenario'] + [c for c in df_params.columns if c != 'Scenario']
+                df_params = df_params[cols]
+                df_params = df_params.fillna("-")
+                st.dataframe(df_params, use_container_width=True)
+            else:
+                st.info("No parameter data available.")
+
+    return df_results
+
+# -------------------------
+# Streamlit App
+# -------------------------
+
+st.set_page_config(page_title="Model Diagnostic Dashboard – Pro + PDF + Models", layout="wide")
+st.title("🚀 Model Diagnostic Dashboard – Full Edition")
+st.markdown("All-in-one: UI polish, PDF export, extra models, TimeSeriesSplit, progress bars, SHAP/LIME/PFI.")
+
+# Sidebar
+st.sidebar.header("Upload & Settings")
+uploaded_file = st.sidebar.file_uploader("Upload CSV (must include target column)", type=['csv'])
 if not uploaded_file:
-    st.info("👋 Please upload a CSV file.")
+    st.info("Please upload a CSV file to proceed. You can use the existing deu.py as example data if you prefer.")
     st.stop()
 
 try:
     df_original = pd.read_csv(uploaded_file)
-    st.success("Data Loaded.")
-    
-    st.sidebar.subheader("1.1 Date Column")
-    date_cols = [c for c in df_original.columns if 'date' in c.lower() or 'time' in c.lower()]
-    idx = (list(df_original.columns).index(date_cols[0]) + 1) if date_cols else 0
-    date_col = st.sidebar.selectbox("Date Column", [None] + list(df_original.columns), index=idx)
-    
-    if date_col:
-        df_original[date_col] = pd.to_datetime(df_original[date_col])
-        df_original.set_index(date_col, inplace=True)
+    st.sidebar.success("Loaded CSV")
 except Exception as e:
-    st.error(f"Error: {e}")
+    st.sidebar.error(f"Failed reading CSV: {e}")
     st.stop()
 
-# --- CONFIGURATION ---
-st.sidebar.header("2. Configuration")
+# Date handling
 cols = df_original.columns.tolist()
-target_def = 'Power' if 'Power' in cols else cols[-1]
-target_col = st.sidebar.selectbox("Target", cols, index=cols.index(target_def))
-feats_def = [c for c in cols if c != target_col]
-feature_cols = st.sidebar.multiselect("Features", cols, default=feats_def)
-if not feature_cols: st.stop()
+date_guess = [c for c in cols if 'date' in c.lower() or 'time' in c.lower()]
+date_col = st.sidebar.selectbox('Date column (optional)', [None] + cols, index=0)
+if date_col:
+    try:
+        df_original[date_col] = pd.to_datetime(df_original[date_col])
+        df_original.set_index(date_col, inplace=True)
+        df_original = df_original.sort_index()
+    except Exception:
+        st.sidebar.warning('Could not parse date column - leaving as-is')
 
-st.sidebar.header("3. Preprocessing")
-outlier_methods = st.sidebar.multiselect("Outlier Methods", ["IQR Capping", "Z-Score Capping", "Isolation Forest (Drop)"])
-scaling_methods = st.sidebar.multiselect("Scaling Methods", ["Min-Max Scaling (0-1)", "Standard Scaling (Z-Score)", "Robust Scaling (IQR based)", "MaxAbs Scaling (-1 to 1)", "Log Transformation (np.log1p)"])
+# Target & features
+target_default = 'Power' if 'Power' in cols else cols[-1]
+target_col = st.sidebar.selectbox('Target column', cols, index=cols.index(target_default))
+feature_cols = st.sidebar.multiselect('Feature columns', [c for c in cols if c!=target_col], default=[c for c in cols if c!=target_col][:6])
+if not feature_cols:
+    st.sidebar.error('Select at least one feature')
+    st.stop()
 
-st.sidebar.header("4. HPO & Analysis")
+# Models
+available = ["HistGradientBoosting","RandomForest","GradientBoosting","CatBoost","XGBoost","LightGBM"]
+avail_filtered = [m for m in available if not (m=="XGBoost" and XGBRegressor is None) and not (m=="LightGBM" and LGBMRegressor is None) and not (m=="CatBoost" and CatBoostRegressor is None)]
+selected_models = st.sidebar.multiselect('Models', avail_filtered, default=[avail_filtered[0]])
 
-hpo_methods = st.sidebar.multiselect("HPO Methods", ["Random Search", "Grid Search"])
+# Metrics
+metric_options = ["RMSE", "MAE", "R2", "MSE", "MAPE", "MedAE"]
+selected_metrics = st.sidebar.multiselect('Evaluation Metrics', metric_options, default=["MSE", "RMSE", "MAE", "R2"])
+if not selected_metrics:
+    st.sidebar.error("Please select at least one metric.")
+    st.stop()
 
-# --- YARDIM BÖLÜMÜ (YENİ) ---
-if hpo_methods:
-    with st.expander("ℹ️ HPO Parametreleri Hakkında Bilgi"):
-        st.markdown("""
-        `HistGradientBoostingRegressor` için kullanılan temel HPO parametreleri ve anlamları:
+# Preproc
+outlier_methods = st.sidebar.multiselect('Outlier handling (Training Data Only)', ["IQR Capping","Z-Score Capping","Isolation Forest (Drop)"])
+scaling_methods = st.sidebar.multiselect('Scaling (Fit on Train, Transform Test)', ["Min-Max Scaling (0-1)","Standard Scaling (Z-Score)","Robust Scaling (IQR based)","MaxAbs Scaling (-1 to 1)","Log Transformation (np.log1p)"])
 
-        | Parametre | Açıklama |
-        | :--- | :--- |
-        | **`learning_rate`** | Modelin her iterasyonda ne kadar hızlı öğrendiğini kontrol eder. Düşük değerler daha sağlam modeller üretir. |
-        | **`max_iter`** | Oluşturulacak ağaç sayısıdır. Modelin karmaşıklığını ve öğrenme süresini belirler. |
-        | **`max_leaf_nodes`** | Her bir ağaçtaki maksimum yaprak sayısıdır. Ağaçların karmaşıklığını doğrudan kontrol eder. |
-        | **`max_depth`** | Ağaçların maksimum derinliğini sınırlar. Aşırı öğrenmeyi (overfitting) engellemeye yardımcı olur. |
-        | **`min_samples_leaf`** | Bir yaprağın (leaf) geçerli sayılması için gereken minimum örnek (veri noktası) sayısıdır. |
-        | **`l2_regularization`** | Aşırı öğrenmeyi engellemek için kullanılan bir ceza (penalty) terimidir. |
-        | **`max_bins`** | Özelliklerin (features) kaç farklı gruba ayrılacağını belirler. Modelin hızını ve doğruluğunu etkiler. |
-        
-        **Not:** `Random Search` daha geniş bir aralıkta rastgele arama yaparken, `Grid Search` belirlediğiniz spesifik değerleri dener.
-        """)
+# HPO and XAI
+hpo_methods = st.sidebar.multiselect('HPO Methods', ['Random Search','Grid Search'])
+xai_methods = st.sidebar.multiselect('XAI Methods', ['SHAP','PFI','LIME'])
 
-st.sidebar.header("5. XAI")
-run_shap = st.sidebar.checkbox("Run SHAP Analysis?", value=False)
+st.sidebar.markdown("---")
+st.sidebar.markdown("**View Options**")
+use_timesplit = st.sidebar.checkbox('Use Time-series split (train on earliest, test on latest)', value=True)
+show_combined = st.sidebar.checkbox('Show combined forecast', value=True)
+show_forecasts = st.sidebar.checkbox('Show scenario forecasts', value=True)
+show_diags = st.sidebar.checkbox('Show diagnostics', value=True)
 
-st.sidebar.header("6. Visualization Settings")
-show_combined = st.sidebar.checkbox("Show Combined Forecast Plot", value=True)
-show_individual = st.sidebar.checkbox("Show Individual Forecast Plots", value=True)
-show_diagnostic = st.sidebar.checkbox("Show Diagnostic Plots", value=True)
+train_btn = st.sidebar.button('Train & Run All')
 
-# --- TRAINING ---
-test_size = st.sidebar.slider("Test Split", 0.1, 0.5, 0.2)
-
-if st.sidebar.button("Train & Compare All Scenarios"):
-    with st.spinner("Training..."):
-        res_store = {}
-        
-        # 1. Default
-        X_def = df_original[feature_cols]
-        y_def = df_original[target_col]
-        m, mod, Xt, Xte, yte, ypr = train_and_evaluate(X_def, y_def, test_size)
-        res_store['Default'] = {'metrics': m, 'model': mod, 'Xt': Xt, 'Xte': Xte, 'yte': yte, 'ypr': ypr}
-        
-        # 2. Preprocessed
-        df_b = apply_outlier_handling(df_original, feature_cols, outlier_methods) if outlier_methods else df_original.copy()
-        df_p = apply_scaling(df_b, feature_cols, scaling_methods) if scaling_methods else df_b
-        label_p = "Processed" if (outlier_methods or scaling_methods) else None
-        
-        if label_p:
-            Xp, yp = df_p[feature_cols], df_p[target_col]
-            m, mod, Xt, Xte, yte, ypr = train_and_evaluate(Xp, yp, test_size)
-            res_store[label_p] = {'metrics': m, 'model': mod, 'Xt': Xt, 'Xte': Xte, 'yte': yte, 'ypr': ypr}
-            
-        # 3. HPO
-        data_hpo = df_p if label_p else df_original
-        for hpo in hpo_methods:
-            lbl = f"HPO ({hpo})"
-            if label_p: lbl = f"Processed + {lbl}"
-            Xh, yh = data_hpo[feature_cols], data_hpo[target_col]
-            m, mod, Xt, Xte, yte, ypr = train_and_evaluate(Xh, yh, test_size, hpo)
-            res_store[lbl] = {'metrics': m, 'model': mod, 'Xt': Xt, 'Xte': Xte, 'yte': yte, 'ypr': ypr}
-            
-        st.session_state['res_store'] = res_store
-        st.session_state['trained'] = True
-
-# --- RESULTS ---
-if st.session_state['trained']:
-    results = st.session_state['res_store']
+# --- EĞİTİM ALGORİTMASI (FIXED: Clean Loop) ---
+if train_btn:
+    st.info('Starting training — this may take some time depending on models and HPO.')
+    results = {}
+    progress = st.progress(0)
     
-# --- METRICS & PARAMS (Redesigned) ---
-st.markdown("---")
-st.subheader("📊 Model Performance & Configuration Report")
-
-# 1. Verileri Hazırla
-m_data = []
-p_data = []
-# Yeni parametreleri listeye ekleyin
-k_params = [
-    'learning_rate', 'max_iter', 'max_leaf_nodes', 'max_depth', 
-    'min_samples_leaf', 'l2_regularization', 'max_bins'
-]
-
-
-for n, r in results.items():
-    # Metrik Verisi
-    me = r['metrics']
-    m_data.append({
-        "Scenario": n, 
-        "RMSE": me['RMSE'], 
-        "MAE": me['MAE'], 
-        "R2": me['R2'], 
-        "MSE": me['MSE']
+    # Senaryo Hazırlığı (Döngü Karmaşıklığını Azaltma)
+    # Her model için hangi varyasyonların çalışacağını belirliyoruz
+    scenarios = []
+    
+    # 1. Default (Her zaman var)
+    scenarios.append({
+        "suffix": "Default",
+        "hpo": None,
+        "use_prep": False
     })
-    
-    # Parametre Verisi
-    p = r['model'].get_params()
-    row = {"Scenario": n}
-    for k in k_params:
-        row[k] = p.get(k, '-')
-    p_data.append(row)
 
-df_metrics = pd.DataFrame(m_data).set_index("Scenario")
-df_params = pd.DataFrame(p_data).set_index("Scenario")
-
-# 2. Sekmeli Görünüm
-tab_leaderboard, tab_params, tab_visuals = st.tabs([
-    "🏆 Leaderboard (Metrics)", 
-    "⚙️ Hyperparameters", 
-    "📈 Visual Comparison"
-])
-
-with tab_leaderboard:
-    st.markdown("Modellerin performans karşılaştırması. **R²** için yüksek, **Hata (Error)** metrikleri için düşük değerler iyidir.")
-    
-    # Pandas Styler ile Renklendirme (Highlight Best)
-    st.dataframe(
-        df_metrics.style
-        .highlight_max(subset=['R2'], color='#d1e7dd')  # En iyi R2 Yeşil
-        .highlight_min(subset=['RMSE', 'MAE', 'MSE'], color='#cff4fc') # En düşük Hata Mavi
-        .format("{:.4f}"),
-        use_container_width=True
-    )
-    
-    # # CSV İndirme Butonu
-    # csv_metrics = df_metrics.to_csv().encode('utf-8')
-    # st.download_button(
-    #     label="📥 Download Metrics CSV",
-    #     data=csv_metrics,
-    #     file_name='model_metrics.csv',
-    #     mime='text/csv',
-    # )
-
-with tab_params:
-    st.markdown("Modellerin eğitiminde kullanılan hiperparametreler.")
-    st.dataframe(df_params, use_container_width=True)
-    
-    with st.expander("🔍 See Full Raw Parameters (JSON)"):
-        for n, r in results.items():
-            st.text(f"{n}: {r['model'].get_params()}")
-
-with tab_visuals:
-    st.markdown("#### ⚔️ Model Performance Benchmark")
-
-    fig = go.Figure()
-
-    # --- RMSE Bar ---
-    fig.add_trace(go.Bar(
-        x=df_metrics.index,
-        y=df_metrics["RMSE"],
-        name="RMSE",
-        marker=dict(color="rgba(255, 99, 71, 0.75)"),  # soft tomato
-        hovertemplate="<b>%{x}</b><br>RMSE: %{y:.4f}<extra></extra>"
-    ))
-
-    # --- MSE Bar ---
-    fig.add_trace(go.Bar(
-        x=df_metrics.index,
-        y=df_metrics["MSE"],
-        name="MSE",
-        marker=dict(color="rgba(255, 159, 64, 0.75)"),  # pastel orange
-        hovertemplate="<b>%{x}</b><br>MSE: %{y:.4f}<extra></extra>"
-    ))
-
-    # --- MAE Bar ---
-    fig.add_trace(go.Bar(
-        x=df_metrics.index,
-        y=df_metrics["MAE"],
-        name="MAE",
-        marker=dict(color="rgba(255, 205, 86, 0.75)"),  # lemon pastel
-        hovertemplate="<b>%{x}</b><br>MAE: %{y:.4f}<extra></extra>"
-    ))
-
-    # --- R² Line + Marker ---
-    fig.add_trace(go.Scatter(
-        x=df_metrics.index,
-        y=df_metrics["R2"],
-        name="R²",
-        mode="lines+markers",
-        marker=dict(size=13, color="#007aff", line=dict(width=2, color="white")),  # iOS blue
-        line=dict(width=4, color="#007aff"),
-        yaxis="y2",
-        hovertemplate="<b>%{x}</b><br>R²: %{y:.4f}<extra></extra>"
-    ))
-
-    # --- Layout: Apple Minimal Theme ---
-    fig.update_layout(
-        template="plotly_white",
-        title=dict(
-            text="📊 Model Performance Overview ",
-            x=0.5,
-            font=dict(size=22, color="#333", family="Helvetica Neue")
-        ),
-        xaxis=dict(
-            title="Scenario",
-            tickfont=dict(size=12, family="Helvetica Neue"),
-            showgrid=False
-        ),
-        yaxis=dict(
-            title="RMSE / MSE / MAE",
-            titlefont=dict(size=14, color="#555", family="Helvetica Neue"),
-            tickfont=dict(size=12, color="#666", family="Helvetica Neue"),
-            gridcolor="rgba(0,0,0,0.07)"
-        ),
-        yaxis2=dict(
-            title="R²",
-            overlaying="y",
-            side="right",
-            range=[0, 1],
-            titlefont=dict(size=14, color="#007aff"),
-            tickfont=dict(size=12, color="#007aff"),
-        ),
-        barmode="group",
-        bargap=0.25,
-        margin=dict(l=40, r=40, t=70, b=40),
-        legend=dict(
-            orientation="h",
-            x=0.02, y=1.07,
-            font=dict(size=12, family="Helvetica Neue")
-        ),
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    # --- Analysis ---
-    best_r2_model = df_metrics["R2"].idxmax()
-    best_r2_val = df_metrics["R2"].max()
-    best_rmse_model = df_metrics["RMSE"].idxmin()
-    best_mse_model = df_metrics["MSE"].idxmin()
-    best_mae_model = df_metrics["MAE"].idxmin()
-
-    st.info(f"""
-    **💡 Otomatik Analiz:**
-    * **En yüksek R²:** `{best_r2_model}` (R² = **{best_r2_val:.4f}**)
-    * **En düşük RMSE:** `{best_rmse_model}`
-    * **En düşük MSE:** `{best_mse_model}`
-    * **En düşük MAE:** `{best_mae_model}`
-    
-    **📌 Genel öneri:**  
-    *Güvenlik kritik durumlarda RMSE & MAE daha önemlidir,  
-    genel performans değerlendirmede ise R² belirleyicidir.*
-    """)
-
+    # 2. Preprocessed (Eğer seçildiyse)
+    if outlier_methods or scaling_methods:
+        scenarios.append({
+            "suffix": "Preprocessed",
+            "hpo": None,
+            "use_prep": True
+        })
         
-    # --- VISUALIZATION ---
-    st.subheader("Analysis")
-    scenarios = list(results.keys())
-    
-    # Ana Tablar (Combined + Senaryolar)
-    main_tabs_labels = []
-    if show_combined: main_tabs_labels.append("📈 Combined Plot")
-    main_tabs_labels.extend(scenarios)
-    
-    if not main_tabs_labels:
-        st.warning("No plots selected in sidebar.")
-    else:
-        main_tabs = st.tabs(main_tabs_labels)
-        curr_tab_idx = 0
-        
-        # 1. Combined Plot
-        if show_combined:
-            with main_tabs[curr_tab_idx]:
-                ref = scenarios[0]
-                max_p = len(results[ref]['yte'])
-                n_pts = st.number_input("Points", 1, max_p, min(48, max_p), key="comb")
-                fig = go.Figure()
-                
-                # Actual
-                y_ref = results[ref]['yte'].sort_index().head(n_pts)
-                fig.add_trace(go.Scatter(x=y_ref.index, y=y_ref, name="Actual", line=dict(color='black', width=3)))
-                
-                # Preds
-                colors = px.colors.qualitative.Plotly
-                for i, (name, r) in enumerate(results.items()):
-                    yp = pd.Series(r['ypr'], index=r['yte'].index).sort_index().head(n_pts)
-                    fig.add_trace(go.Scatter(x=yp.index, y=yp, name=f"Pred: {name}", line=dict(color=colors[i%len(colors)], dash='dot')))
-                
-                fig.update_layout(template="plotly_white", title="Combined Forecast")
-                st.plotly_chart(fig, use_container_width=True)
-            curr_tab_idx += 1
+    # 3. HPO (Eğer seçildiyse)
+    # Not: HPO'yu genellikle clean data (Preprocessed) üzerinde yapmak mantıklıdır.
+    # Eğer preprocessing seçili değilse raw data üzerinde çalışır.
+    for hpo in hpo_methods:
+        scenarios.append({
+            "suffix": f"HPO ({hpo})",
+            "hpo": hpo,
+            "use_prep": True if (outlier_methods or scaling_methods) else False
+        })
+
+    # Toplam işlem sayısı progress bar için
+    total_tasks = len(selected_models) * len(scenarios)
+    task_idx = 0
+
+    # Ana Döngü
+    for model_name in selected_models:
+        for scen in scenarios:
+            # Etiket oluşturma
+            label = f"{model_name} - {scen['suffix']}"
             
-        # 2. Scenario Tabs
-        for i, sc_name in enumerate(scenarios):
-            with main_tabs[curr_tab_idx + i]:
-                dat = results[sc_name]
-                y_test = dat['yte']
-                y_pred = dat['ypr']
-                resid = y_test - y_pred
+            # Parametre ayarı
+            current_outlier = outlier_methods if scen['use_prep'] else None
+            current_scaling = scaling_methods if scen['use_prep'] else None
+            
+            # Veri Hazırlığı
+            # Veri artık fonksiyon içinde split edilip işleniyor, buraya raw gönderiyoruz.
+            X_raw = df_original[feature_cols]
+            y_raw = df_original[target_col]
+            
+            def prog_cb(p): 
+                # Progress bar güncelleme alt fonksiyonu
+                val = min(100, int((task_idx/total_tasks*100) + p/total_tasks))
+                progress.progress(val)
+
+            try:
+                # Fonksiyon Çağrısı (Refactored)
+                metrics, model, Xt, Xte, yte, ypr = train_and_evaluate(
+                    X_raw, y_raw, 
+                    test_size=0.2, 
+                    model_name=model_name, 
+                    hpo_method=scen['hpo'], 
+                    use_timesplit=use_timesplit, 
+                    progress_callback=prog_cb, 
+                    active_metrics=selected_metrics,
+                    outlier_methods=current_outlier,
+                    scaling_methods=current_scaling
+                )
                 
-                # Alt Tablar (Feature bazlı)
-                sub_labels = []
-                if show_individual: sub_labels.append("Forecast")
-                if show_diagnostic: sub_labels.append("Diagnostics")
-                if run_shap: sub_labels.append("XAI (SHAP)")
+                results[label] = {'metrics':metrics,'model':model,'Xt':Xt,'Xte':Xte,'yte':yte,'ypr':ypr}
                 
-                if not sub_labels:
-                    st.info("Select plots from sidebar.")
-                else:
-                    sub_tabs = st.tabs(sub_labels)
-                    s_idx = 0
-                    
-                    # A. Forecast (Enhanced Interactive)
-                    if show_individual:
-                        with sub_tabs[s_idx]:
-                            # 1. Kontrol Paneli (Slicing Controls)
-                            st.markdown("#### 🕹️ Interactive Forecast Explorer")
-                            c1, c2 = st.columns([1, 3])
-                            
-                            total_points = len(y_test)
-                            with c1:
-                                # Pencere Boyutu (Ne kadar veri göreceğiz?)
-                                window_size = st.slider(
-                                    f"Window Size ({sc_name})", 
-                                    min_value=24, 
-                                    max_value=min(1000, total_points), 
-                                    value=min(100, total_points), 
-                                    step=24,
-                                    key=f"win_{i}"
-                                )
-                            with c2:
-                                # Başlangıç Noktası (Veri içinde kaydır)
-                                start_idx = st.slider(
-                                    f"Start Index (Scroll through time) - {sc_name}", 
-                                    min_value=0, 
-                                    max_value=max(0, total_points - window_size), 
-                                    value=0, 
-                                    step=1,
-                                    key=f"start_{i}"
-                                )
-                            
-                            # 2. Veriyi Hazırla
-                            # Veriyi indexe göre sıralayıp kesiyoruz (Slicing)
-                            df_viz = pd.DataFrame({'Act': y_test, 'Pred': y_pred}, index=y_test.index).sort_index()
-                            df_slice = df_viz.iloc[start_idx : start_idx + window_size]
-                            
-                            # 3. Anlık Metrikler (Sadece bu pencere için)
-                            slice_mae = mean_absolute_error(df_slice['Act'], df_slice['Pred'])
-                            slice_r2 = r2_score(df_slice['Act'], df_slice['Pred'])
-                            
-                            m1, m2, m3, m4 = st.columns(4)
-                            m1.metric("Slice MAE", f"{slice_mae:.3f}", delta_color="inverse")
-                            m2.metric("Slice R²", f"{slice_r2:.3f}")
-                            m3.markdown(f"**Start Date:** {df_slice.index[0]}")
-                            m4.markdown(f"**End Date:** {df_slice.index[-1]}")
+            except Exception as e:
+                st.error(f"Error in {label}: {e}")
+            
+            task_idx += 1
+            progress.progress(min(100, int(task_idx/total_tasks*100)))
 
-                            # 4. Profesyonel Çizim (Subplots)
-                            from plotly.subplots import make_subplots # Import'u buraya ekledim, global'e de taşınabilir.
-                            
-                            fig_forecast = make_subplots(
-                                rows=2, cols=1, 
-                                shared_xaxes=True, 
-                                vertical_spacing=0.1, 
-                                row_heights=[0.7, 0.3],
-                                subplot_titles=("Actual vs Predicted Trend", "Residuals (Difference)")
-                            )
-                            
-                            # Trace 1: Actual (Gerçek)
-                            fig_forecast.add_trace(go.Scatter(
-                                x=df_slice.index, y=df_slice['Act'], 
-                                name='Actual',
-                                mode='lines',
-                                line=dict(color='black', width=2)
-                            ), row=1, col=1)
-                            
-                            # Trace 2: Predicted (Tahmin)
-                            fig_forecast.add_trace(go.Scatter(
-                                x=df_slice.index, y=df_slice['Pred'], 
-                                name='Predicted',
-                                mode='lines',
-                                line=dict(color='#FF8C00', width=2, dash='solid'), # Solar Orange
-                                fill='tonexty', # Aradaki farkı boyar (isteğe bağlı)
-                                fillcolor='rgba(255, 140, 0, 0.1)' 
-                            ), row=1, col=1)
-                            
-                            # Trace 3: Residuals (Hata Çubukları)
-                            residuals = df_slice['Act'] - df_slice['Pred']
-                            colors = ['crimson' if val < 0 else 'royalblue' for val in residuals]
-                            
-                            fig_forecast.add_trace(go.Bar(
-                                x=df_slice.index, y=residuals, 
-                                name='Residuals',
-                                marker_color=colors,
-                                opacity=0.8
-                            ), row=2, col=1)
-                            
-                            # Layout Ayarları
-                            fig_forecast.update_layout(
-                                height=600, 
-                                template="plotly_white",
-                                hovermode="x unified",
-                                xaxis2_title="Date/Time",
-                                yaxis_title="Power",
-                                yaxis2_title="Error",
-                                showlegend=True,
-                                legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center")
-                            )
-                            
-                            # Range Slider (Alternatif gezinme)
-                            fig_forecast.update_xaxes(rangeslider_visible=False) # Kendi slider'ımız olduğu için kapattım
-                            
-                            st.plotly_chart(fig_forecast, use_container_width=True)
-                            
-                            with st.expander("See Raw Data for Selected Window"):
-                                st.dataframe(df_slice)
+    st.success('Training complete')
+    st.session_state['results_all'] = results
 
-                        s_idx += 1
+# --- SONUÇLARI GÖSTERME (EĞİTİM BUTTONUNUN DIŞINDA) ---
+if 'results_all' in st.session_state:
+    results = st.session_state['results_all']
+    
+    df_results = display_leaderboard(results)
 
+    # 1. BÖLÜM: FORECASTS
+    if show_combined or show_forecasts:
+        with st.expander("### 📈 Forecast Overview", expanded=False):
+            tabs_to_create = []
+            if show_combined: tabs_to_create.append("Combined Comparison")
+            if show_forecasts: tabs_to_create.append("Individual Scenarios")
+            
+            if tabs_to_create:
+                main_tabs = st.tabs(tabs_to_create)
+                tab_map = dict(zip(tabs_to_create, main_tabs))
+
+                if show_combined and "Combined Comparison" in tab_map:
+                    with tab_map["Combined Comparison"]:
+                        st.markdown("#### All Models vs Actual")
+                        fig = go.Figure()
+                        first = next(iter(results.values()))
+                        n = min(200, len(first['yte']))
                         
-                    # B. Diagnostics (Advanced & Statistical)
-                    if show_diagnostic:
-                        with sub_tabs[s_idx]:
-                            st.markdown("#### 🩺 Model Diagnostics & Statistical Validation")
-                            
-                            # Tanısal sekmeleri oluşturuyoruz (6 Sekme)
-                            diag_tabs = st.tabs([
-                                "🔍 Actual vs Predicted", 
-                                "📊 Residual Dist & Q-Q", 
-                                "📉 Time Series Check",
-                                "🕸️ Residuals vs Predicted",
-                                "📦 Error Box Plot",
-                                "🧮 Statistical Analysis"
-                            ])
-                            
-                            # 1. Actual vs Predicted (Scatter + Color by Error)
-                            with diag_tabs[0]:
-                                col1, col2 = st.columns([3, 1])
-                                with col1:
-                                    fig_scat = go.Figure()
-                                    error_abs = np.abs(y_test - y_pred)
-                                    
-                                    fig_scat.add_trace(go.Scatter(
-                                        x=y_test, y=y_pred,
-                                        mode='markers',
-                                        name='Data Points',
-                                        marker=dict(
-                                            color=error_abs,
-                                            colorscale='Viridis',
-                                            showscale=True,
-                                            colorbar=dict(title="Abs Error"),
-                                            opacity=0.7,
-                                            line=dict(width=0.5, color='DarkSlateGrey')
-                                        ),
-                                        hovertemplate="Actual: %{x:.2f}<br>Predicted: %{y:.2f}<br>Error: %{marker.color:.2f}<extra></extra>"
-                                    ))
-                                    
-                                    # Perfect Fit Line
-                                    min_val, max_val = min(y_test.min(), y_pred.min()), max(y_test.max(), y_pred.max())
-                                    fig_scat.add_trace(go.Scatter(
-                                        x=[min_val, max_val], y=[min_val, max_val],
-                                        mode='lines', name='Perfect Fit',
-                                        line=dict(color='red', dash='dash', width=3)
-                                    ))
-                                    
-                                    fig_scat.update_layout(
-                                        title="Actual vs Predicted (Color by Error Magnitude)",
-                                        xaxis_title="Actual Power",
-                                        yaxis_title="Predicted Power",
-                                        template="plotly_white",
-                                        height=500,
-                                        hovermode="closest"
-                                    )
-                                    st.plotly_chart(fig_scat, use_container_width=True)
-                                
-                                with col2:
-                                    st.markdown("#### Quick Metrics")
-                                    st.metric("Mean Abs Error", f"{mean_absolute_error(y_test, y_pred):.3f}")
-                                    st.metric("Max Error", f"{np.max(error_abs):.3f}")
-                                    # MAPE Calculation (Handling division by zero)
-                                    mask = y_test != 0
-                                    if np.sum(mask) > 0:
-                                        mape = np.mean(np.abs((y_test[mask] - y_pred[mask]) / y_test[mask])) * 100
-                                        st.metric("MAPE", f"{mape:.2f}%")
-                                    else:
-                                        st.metric("MAPE", "N/A")
+                        fig.add_trace(go.Scatter(x=first['yte'].index[:n], y=first['yte'][:n], name='Actual', line=dict(width=3, color='black')))
+                        for name, r in results.items():
+                            yp = pd.Series(r['ypr'], index=r['yte'].index)[:n]
+                            fig.add_trace(go.Scatter(x=yp.index, y=yp, name=name, line=dict(dash='dot')))
+                        fig.update_layout(template='plotly_white', height=450, margin=dict(t=30, b=10))
+                        st.plotly_chart(fig, use_container_width=True)
 
-                            # 2. Residual Histogram + Q-Q Plot
-                            with diag_tabs[1]:
-                                c_hist, c_qq = st.columns(2)
-                                
-                                # Histogram with KDE
-                                with c_hist:
-                                    fig_hist = go.Figure()
-                                    fig_hist.add_trace(go.Histogram(
-                                        x=resid, name='Residuals', histnorm='probability density',
-                                        marker=dict(color='rgba(100, 149, 237, 0.7)', line=dict(color='black', width=0.5))
-                                    ))
-                                    try:
-                                        kde = stats.gaussian_kde(resid)
-                                        x_range = np.linspace(resid.min(), resid.max(), 200)
-                                        fig_hist.add_trace(go.Scatter(
-                                            x=x_range, y=kde(x_range), mode='lines', name='KDE', line=dict(color='darkorange', width=3)
-                                        ))
-                                    except: pass
-                                    fig_hist.add_vline(x=0, line_width=2, line_dash="dash", line_color="red")
-                                    fig_hist.update_layout(title="Residual Distribution", height=500, template="plotly_white")
-                                    st.plotly_chart(fig_hist, use_container_width=True)
+                if show_forecasts and "Individual Scenarios" in tab_map:
+                    with tab_map["Individual Scenarios"]:
+                        scenario_names = list(results.keys())
+                        if scenario_names:
+                            sub_tabs = st.tabs(scenario_names)
+                            for i, scenario in enumerate(scenario_names):
+                                with sub_tabs[i]:
+                                    sel = results[scenario]
+                                    display_forecast_plots(sel['yte'], sel['ypr'], scenario, key_prefix=f"ind_forecast_{i}")
 
-                                # Q-Q Plot
-                                with c_qq:
-                                    qq_fig = go.Figure()
-                                    (osm, osr), (slope, intercept, r) = stats.probplot(resid, dist="norm", plot=None)
-                                    qq_fig.add_trace(go.Scatter(x=osm, y=osr, mode='markers', name='Residuals'))
-                                    qq_fig.add_trace(go.Scatter(
-                                        x=osm, y=slope*osm + intercept, mode='lines', name='Normal Fit',
-                                        line=dict(color='red', width=2)
-                                    ))
-                                    qq_fig.update_layout(
-                                        title="Q-Q Plot (Normality Check)",
-                                        xaxis_title="Theoretical Quantiles",
-                                        yaxis_title="Sample Quantiles",
-                                        height=500,
-                                        template="plotly_white"
-                                    )
-                                    st.plotly_chart(qq_fig, use_container_width=True)
+    # 2. BÖLÜM: DIAGNOSTICS
+    if show_diags:
+        with st.expander("### 🔍 Model Diagnostics", expanded=False):
+            scenario_names = list(results.keys())
+            if scenario_names:
+                d_tabs = st.tabs(scenario_names)
+                for i, scenario in enumerate(scenario_names):
+                    with d_tabs[i]:
+                        sel = results[scenario]
+                        display_diagnostic_plots(sel['yte'], sel['ypr'], key_prefix=f"diag_{i}")
+                        interpret_model_diagnostics(sel['yte'], sel['ypr'])
 
-                            # 3. Time Series Check (Zoomable)
-                            with diag_tabs[2]:
-                                st.markdown("**Zoomable Forecast Check (Ordered by Index)**")
-                                # Veriyi indexe göre sıralayıp (eğer zaman ise) çizelim
-                                df_ts = pd.DataFrame({'Actual': y_test, 'Predicted': y_pred}).sort_index()
-                                
-                                fig_ts = go.Figure()
-                                fig_ts.add_trace(go.Scatter(x=df_ts.index, y=df_ts['Actual'], name='Actual', line=dict(color='black', width=1)))
-                                fig_ts.add_trace(go.Scatter(x=df_ts.index, y=df_ts['Predicted'], name='Predicted', line=dict(color='red', width=1, dash='dot')))
-                                
-                                fig_ts.update_layout(
-                                    title="Actual vs Predicted Over Time (Zoom In/Out)",
-                                    xaxis_title="Date/Index",
-                                    yaxis_title="Power",
-                                    height=500,
-                                    template="plotly_white",
-                                    xaxis_rangeslider_visible=True # Alt tarafa mini slider ekler
-                                )
-                                st.plotly_chart(fig_ts, use_container_width=True)
+    # 3. BÖLÜM: XAI
+    if xai_methods:
+        with st.expander("🧠 Explainable AI (XAI) Analysis", expanded=False):        
+            scenario_names = list(results.keys())
+            if scenario_names:
+                xai_tabs = st.tabs(scenario_names)
+                for i, scenario in enumerate(scenario_names):
+                    with xai_tabs[i]:
+                        sel_xai = results[scenario]
+                        safe_key = scenario.replace(" ","_")
+                        run_xai_analysis(sel_xai['model'], sel_xai['Xt'], sel_xai['Xte'], sel_xai['yte'], sel_xai['ypr'], xai_methods, key_suffix=f"xai_tab_{i}_{safe_key}")
 
-                                # Residuals over Time
-                                fig_res_time = go.Figure()
-                                fig_res_time.add_trace(go.Scatter(
-                                    x=df_ts.index, 
-                                    y=df_ts['Actual'] - df_ts['Predicted'],
-                                    mode='markers',
-                                    marker=dict(size=4, color='gray'),
-                                    name='Residuals'
-                                ))
-                                fig_res_time.add_hline(y=0, line_color='red')
-                                fig_res_time.update_layout(
-                                    title="Residuals Over Time (Homoscedasticity Check)",
-                                    height=350,
-                                    template="plotly_white"
-                                )
-                                st.plotly_chart(fig_res_time, use_container_width=True)
+    # 4. BÖLÜM: EXPORT (PDF & CSV)
+    st.markdown("---")
+    st.markdown("### 📥 Export Full Report")
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        csv_data = df_results.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📄 Download Metrics (CSV)",
+            data=csv_data,
+            file_name="leaderboard.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+        
+    with col2:       
+        if st.button("Generate PDF Report"):
+            with st.spinner("Generating PDF..."):
+                try:
+                    pdf_data = generate_pdf_report(results)
+                    st.session_state['pdf_ready'] = pdf_data
+                except Exception as e:
+                    st.error(f"Error generating PDF: {e}")
 
-                            # 4. Residuals vs Predicted
-                            with diag_tabs[3]:
-                                fig_res = go.Figure()
-                                fig_res.add_trace(go.Scatter(
-                                    x=y_pred, y=resid, mode='markers',
-                                    marker=dict(color=resid, colorscale='RdBu', cmid=0, showscale=True, opacity=0.8)
-                                ))
-                                fig_res.add_hline(y=0, line_color="black", line_width=2, line_dash="dash")
-                                fig_res.update_layout(
-                                    title="Residuals vs Predicted",
-                                    xaxis_title="Predicted Values",
-                                    yaxis_title="Residuals",
-                                    template="plotly_white",
-                                    height=500
-                                )
-                                st.plotly_chart(fig_res, use_container_width=True)
+        if 'pdf_ready' in st.session_state:
+            st.download_button(
+                label="📕 Download Ready PDF",
+                data=st.session_state['pdf_ready'],
+                file_name="comprehensive_model_report.pdf",
+                mime="application/pdf",
+                use_container_width=True
+            )
 
-                            # 5. Error Box Plot
-                            with diag_tabs[4]:
-                                fig_box = go.Figure()
-                                fig_box.add_trace(go.Box(y=resid, name="Residuals", boxmean='sd', marker_color='indianred'))
-                                fig_box.add_trace(go.Box(y=error_abs, name="Abs Errors", boxmean='sd', marker_color='lightseagreen'))
-                                fig_box.update_layout(
-                                    title="Error Distribution (Box Plot)",
-                                    yaxis_title="Error Value",
-                                    template="plotly_white",
-                                    height=500
-                                )
-                                st.plotly_chart(fig_box, use_container_width=True)
-
-                            # 6. Statistical Analysis Section
-                            with diag_tabs[5]:
-                                st.markdown("### 🧬 Statistical Validation of Residuals")
-                                
-                                # 1. Normality Tests
-                                shapiro_stat, shapiro_p = stats.shapiro(resid[:5000]) 
-                                k2, p_k2 = stats.normaltest(resid)
-                                skew_val = stats.skew(resid)
-                                kurt_val = stats.kurtosis(resid)
-                                
-                                # 2. Autocorrelation (Durbin-Watson approximation)
-                                resid_diff = np.diff(resid)
-                                if np.sum(resid ** 2) > 0:
-                                    dw_stat = np.sum(resid_diff ** 2) / np.sum(resid ** 2)
-                                else:
-                                    dw_stat = 0
-                                
-                                # 3. Homoscedasticity Check
-                                corr_het, _ = stats.pearsonr(y_pred, np.abs(resid))
-                                
-                                # Tablo Hazırlama
-                                stat_data = [
-                                    {"Test": "Shapiro-Wilk (Normality)", "Statistic": f"{shapiro_stat:.4f}", "P-Value": f"{shapiro_p:.4e}", "Result": "Normal" if shapiro_p > 0.05 else "Not Normal"},
-                                    {"Test": "D'Agostino's K^2 (Normality)", "Statistic": f"{k2:.4f}", "P-Value": f"{p_k2:.4e}", "Result": "Normal" if p_k2 > 0.05 else "Not Normal"},
-                                    {"Test": "Durbin-Watson (Autocorr)", "Statistic": f"{dw_stat:.4f}", "P-Value": "-", "Result": "No Autocorr" if 1.5 < dw_stat < 2.5 else "Autocorrelation Detected"},
-                                    {"Test": "Homoscedasticity (Corr)", "Statistic": f"{corr_het:.4f}", "P-Value": "-", "Result": "Homoscedastic" if abs(corr_het) < 0.1 else "Heteroscedastic Signs"},
-                                ]
-                                
-                                df_stats = pd.DataFrame(stat_data)
-                                
-                                # Renklendirme Fonksiyonu
-                                def color_results(val):
-                                    color = 'red' 
-                                    if val in ['Normal', 'No Autocorr', 'Homoscedastic']:
-                                        color = 'green'
-                                    elif val == '-':
-                                        color = 'black'
-                                    return f'color: {color}; font-weight: bold'
-
-                                st.table(df_stats.style.applymap(color_results, subset=['Result']))
-                                
-                                c_s1, c_s2 = st.columns(2)
-                                with c_s1:
-                                    st.info(f"**Skewness:** {skew_val:.4f} (0 = Symmetric)")
-                                with c_s2:
-                                    st.info(f"**Kurtosis:** {kurt_val:.4f} (3 = Normal for some defs, 0 for Fisher)")
-                                
-                                st.caption("""
-                                * **Shapiro-Wilk:** P-value > 0.05 assumes normal distribution.
-                                * **Durbin-Watson:** Values around 2.0 indicate no autocorrelation.
-                                * **Homoscedasticity:** Checks correlation between predicted values and absolute errors.
-                                """)
-                            
-                            s_idx += 1
-
-
-                        
-                    # C. SHAP (GÜNCELLENEN KISIM: Violin Eklendi)
-                    if run_shap:
-                        with sub_tabs[s_idx]:
-                            try:
-                                X_bg = dat['Xt'].sample(min(100, len(dat['Xt'])), random_state=42)
-                                exp = shap.Explainer(dat['model'].predict, X_bg)
-                                sv = exp(dat['Xte'])
-                                
-                                # SHAP için 5 alt sekme (Violin Eklendi)
-                                shap_tabs = st.tabs(["Beeswarm", "Violin", "Bar Plot", "Force Plot (Local)", "Data Table"])
-                                
-                                # 1. Beeswarm
-                                with shap_tabs[0]:
-                                    st.markdown("**Summary Plot (Beeswarm)**")
-                                    fig_beeswarm, ax_beeswarm = plt.subplots()
-                                    shap.summary_plot(sv, dat['Xte'], show=False)
-                                    st.pyplot(fig_beeswarm)
-                                    
-                                # 2. Violin Plot (YENİ)
-                                with shap_tabs[1]:
-                                    st.markdown("**Violin Summary Plot**")
-                                    fig_violin, ax_violin = plt.subplots()
-                                    shap.summary_plot(sv, dat['Xte'], plot_type="violin", show=False)
-                                    st.pyplot(fig_violin)
-                                
-                                # 3. Bar Plot
-                                with shap_tabs[2]:
-                                    st.markdown("**Feature Importance (Bar)**")
-                                    fig_bar, ax_bar = plt.subplots()
-                                    shap.summary_plot(sv, dat['Xte'], plot_type="bar", show=False)
-                                    st.pyplot(fig_bar)
-                                        
-                                # 4. Local Explanation
-                                with shap_tabs[3]:
-                                    idx = st.slider(f"Select Index ({sc_name})", 0, len(dat['Xte'])-1, 0, key=f"slider_{i}")
-                                    st.write(f"Index: **{idx}**")
-                                    
-                                    if hasattr  (sv, 'base_values'):
-                                         base = sv.base_values[idx]
-                                         val = sv.values[idx]
-                                    else:
-                                         base = exp.expected_value
-                                         val = sv[idx]
-                                    p = shap.force_plot(base, val, dat['Xte'].iloc[idx], matplotlib=False)
-                                    st_shap(p, height=120)
-                                    
-                                # 5. Data Table
-                                with shap_tabs[4]:
-                                    if hasattr(sv, 'values'):
-                                        shap_df = pd.DataFrame(sv.values, columns=dat['Xte'].columns, index=dat['Xte'].index)
-                                    else:
-                                        shap_df = pd.DataFrame(sv, columns=dat['Xte'].columns, index=dat['Xte'].index)
-                                    st.dataframe(shap_df.head(50))
-
-                            except Exception as e: st.error(f"SHAP Error: {e}")
+st.info('You can re-run training with different options from the sidebar.')
