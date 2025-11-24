@@ -68,105 +68,234 @@ def st_shap(plot, height=None):
     components.html(shap_html, height=height)
 
 def safe_model_factory(name, random_state=42):
+    defaults = MODEL_DEFAULT_PARAMS.get(name, {})
+
     if name == "HistGradientBoosting":
-        return HistGradientBoostingRegressor(random_state=random_state)
+        return HistGradientBoostingRegressor(random_state=random_state, **defaults)
     if name == "RandomForest":
-        return RandomForestRegressor(random_state=random_state)
+        return RandomForestRegressor(random_state=random_state, **defaults)
     if name == "GradientBoosting":
-        return GradientBoostingRegressor(random_state=random_state)
+        return GradientBoostingRegressor(random_state=random_state, **defaults)
     if name == "XGBoost":
-        if XGBRegressor is None: raise ImportError("XGBoost not installed")
-        return XGBRegressor(random_state=random_state, verbosity=0)
+        if XGBRegressor is None:
+            raise ImportError("XGBoost not installed")
+        return XGBRegressor(random_state=random_state, verbosity=0, **defaults)
     if name == "LightGBM":
-        if LGBMRegressor is None: raise ImportError("LightGBM not installed")
-        return LGBMRegressor(random_state=random_state, verbose=-1)
+        if LGBMRegressor is None:
+            raise ImportError("LightGBM not installed")
+        return LGBMRegressor(random_state=random_state, verbose=-1, **defaults)
     if name == "CatBoost":
-        if CatBoostRegressor is None: raise ImportError("CatBoost not installed")
-        return CatBoostRegressor(random_state=random_state, verbose=0, allow_writing_files=False)
+        if CatBoostRegressor is None:
+            raise ImportError("CatBoost not installed")
+        return CatBoostRegressor(random_state=random_state, verbose=0, allow_writing_files=False, **defaults)
+
     return HistGradientBoostingRegressor(random_state=random_state)
 
+MODEL_DEFAULT_PARAMS = {
+    "HistGradientBoosting": {
+        "learning_rate": 0.05,
+        "max_iter": 300,
+        "max_depth": None,
+        "l2_regularization": 0.0,
+        "min_samples_leaf": 30,
+    },
+    "RandomForest": {
+        "n_estimators": 300,
+        "max_depth": None,
+        "min_samples_split": 2,
+        "min_samples_leaf": 1,
+        "max_features": "sqrt",
+        "n_jobs": -1,
+    },
+    "GradientBoosting": {
+        "learning_rate": 0.05,
+        "n_estimators": 200,
+        "max_depth": 3,
+        "subsample": 0.8,
+    },
+    "XGBoost": {
+        "n_estimators": 300,
+        "learning_rate": 0.05,
+        "max_depth": 6,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.0,
+        "reg_lambda": 1.0,
+    },
+    "LightGBM": {
+        "n_estimators": 300,
+        "learning_rate": 0.05,
+        "num_leaves": 31,
+        "max_depth": -1,
+        "subsample": 0.8,
+        "reg_alpha": 0.0,
+        "reg_lambda": 0.0,
+    },
+    "CatBoost": {
+        "iterations": 300,
+        "learning_rate": 0.05,
+        "depth": 6,
+        "l2_leaf_reg": 3.0,
+        "subsample": 0.8,
+    },
+}
 def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scaler_cls=None):
+    """
+    Seçilen model için, sadece MODEL_DEFAULT_PARAMS'te tanımlı hiperparametreler
+    üzerinden Random Search veya Grid Search ile HPO yapan yardımcı fonksiyon.
+    """
+    # 1) Başlangıç modeli ve pipeline
     base_model = safe_model_factory(model_name)
     steps = []
     if scaler_cls is not None:
-        steps.append(('scaler', scaler_cls()))
-    steps.append(('model', base_model))
+        steps.append(("scaler", scaler_cls()))
+    steps.append(("model", base_model))
     pipeline = Pipeline(steps)
+
+    # 2) CV stratejisi
     if use_timesplit:
         cv_strategy = TimeSeriesSplit(n_splits=3)
     else:
         cv_strategy = 3
+
+    # 3) Model bazlı HPO uzayı (geniş uzay; sonra MODEL_DEFAULT_PARAMS ile filtrelenecek)
     random_space = {}
     grid_space = {}
-    # --- HistGradientBoosting ---
+
     if model_name == "HistGradientBoosting":
-        random_space = {'model__learning_rate': stats.loguniform(0.01, 0.3), 'model__max_iter': stats.randint(100, 500),
-                        'model__max_depth': [None, 3, 5, 10], 'model__min_samples_leaf': stats.randint(20, 100),
-                        'model__l2_regularization': stats.loguniform(1e-9, 10)}
-        grid_space = {'model__learning_rate': [0.01, 0.1], 'model__max_iter': [100, 300], 'model__max_depth': [None, 5, 10],
-                      'model__l2_regularization': [0, 0.1, 1.0]}
+        random_space = {
+            "model__learning_rate": stats.loguniform(0.01, 0.3),
+            "model__max_iter": stats.randint(100, 500),
+            "model__max_depth": [None, 3, 5, 10],
+            "model__min_samples_leaf": stats.randint(20, 100),
+            "model__l2_regularization": stats.loguniform(1e-9, 10),
+        }
+        grid_space = {
+            "model__learning_rate": [0.01, 0.1],
+            "model__max_iter": [100, 300],
+            "model__max_depth": [None, 5, 10],
+            "model__l2_regularization": [0, 0.1, 1.0],
+        }
+
     elif model_name == "GradientBoosting":
-        random_space = {'model__learning_rate': stats.loguniform(0.01, 0.3), 'model__n_estimators': stats.randint(100, 300),
-                        'model__max_depth': stats.randint(3, 8), 'model__min_samples_split': stats.randint(2, 20),
-                        'model__min_samples_leaf': stats.randint(1, 10), 'model__subsample': stats.uniform(0.7, 0.3)}
-        grid_space = {'model__learning_rate': [0.01, 0.1], 'model__n_estimators': [100, 200], 'model__max_depth': [3, 5]}
+        random_space = {
+            "model__learning_rate": stats.loguniform(0.01, 0.3),
+            "model__n_estimators": stats.randint(100, 300),
+            "model__max_depth": stats.randint(3, 8),
+            "model__min_samples_split": stats.randint(2, 20),
+            "model__min_samples_leaf": stats.randint(1, 10),
+            "model__subsample": stats.uniform(0.7, 0.3),
+        }
+        grid_space = {
+            "model__learning_rate": [0.01, 0.1],
+            "model__n_estimators": [100, 200],
+            "model__max_depth": [3, 5],
+        }
+
     elif model_name == "RandomForest":
-        random_space = {'model__n_estimators': stats.randint(100, 400), 'model__max_depth': [None, 10, 20, 30],
-                        'model__min_samples_split': stats.randint(2, 15), 'model__min_samples_leaf': stats.randint(1, 10),
-                        'model__max_features': ['sqrt', 'log2', None]}
-        grid_space = {'model__n_estimators': [100, 200], 'model__max_depth': [10, None], 'model__min_samples_split': [2, 5]}
+        random_space = {
+            "model__n_estimators": stats.randint(100, 400),
+            "model__max_depth": [None, 10, 20, 30],
+            "model__min_samples_split": stats.randint(2, 15),
+            "model__min_samples_leaf": stats.randint(1, 10),
+            "model__max_features": ["sqrt", "log2", None],
+        }
+        grid_space = {
+            "model__n_estimators": [100, 200],
+            "model__max_depth": [10, None],
+            "model__min_samples_split": [2, 5],
+        }
+
     elif model_name == "XGBoost":
-        random_space = {'model__n_estimators': stats.randint(100, 500), 'model__learning_rate': stats.loguniform(0.01, 0.3),
-                        'model__max_depth': stats.randint(3, 10), 'model__subsample': stats.uniform(0.6, 0.4),
-                        'model__colsample_bytree': stats.uniform(0.6, 0.4), 'model__reg_alpha': stats.loguniform(1e-5, 10),
-                        'model__reg_lambda': stats.loguniform(1e-5, 10)}
-        grid_space = {'model__n_estimators': [100, 300], 'model__learning_rate': [0.01, 0.1], 'model__max_depth': [3, 6]}
+        random_space = {
+            "model__n_estimators": stats.randint(100, 500),
+            "model__learning_rate": stats.loguniform(0.01, 0.3),
+            "model__max_depth": stats.randint(3, 10),
+            "model__subsample": stats.uniform(0.6, 0.4),
+            "model__colsample_bytree": stats.uniform(0.6, 0.4),
+            "model__reg_alpha": stats.loguniform(1e-5, 10),
+            "model__reg_lambda": stats.loguniform(1e-5, 10),
+        }
+        grid_space = {
+            "model__n_estimators": [100, 300],
+            "model__learning_rate": [0.01, 0.1],
+            "model__max_depth": [3, 6],
+        }
+
     elif model_name == "LightGBM":
-        random_space = {'model__n_estimators': stats.randint(100, 500), 'model__learning_rate': stats.loguniform(0.01, 0.3),
-                        'model__num_leaves': stats.randint(20, 150), 'model__max_depth': stats.randint(-1, 15),
-                        'model__reg_alpha': stats.uniform(0, 1), 'model__reg_lambda': stats.uniform(0, 1),
-                        'model__subsample': stats.uniform(0.6, 0.4)}
-        grid_space = {'model__n_estimators': [100, 300], 'model__learning_rate': [0.01, 0.1], 'model__num_leaves': [31, 63]}
+        random_space = {
+            "model__n_estimators": stats.randint(100, 500),
+            "model__learning_rate": stats.loguniform(0.01, 0.3),
+            "model__num_leaves": stats.randint(20, 150),
+            "model__max_depth": stats.randint(-1, 15),
+            "model__reg_alpha": stats.uniform(0, 1),
+            "model__reg_lambda": stats.uniform(0, 1),
+            "model__subsample": stats.uniform(0.6, 0.4),
+        }
+        grid_space = {
+            "model__n_estimators": [100, 300],
+            "model__learning_rate": [0.01, 0.1],
+            "model__num_leaves": [31, 63],
+        }
+
     elif model_name == "CatBoost":
-        random_space = {'model__iterations': stats.randint(100, 500), 'model__learning_rate': stats.loguniform(0.01, 0.3),
-                        'model__depth': stats.randint(4, 10), 'model__l2_leaf_reg': stats.randint(1, 10),
-                        'model__subsample': stats.uniform(0.6, 0.4)}
-        grid_space = {'model__iterations': [200], 'model__learning_rate': [0.03, 0.1], 'model__depth': [6, 8]}
-    
-    final_params = {}
+        random_space = {
+            "model__iterations": stats.randint(100, 500),
+            "model__learning_rate": stats.loguniform(0.01, 0.3),
+            "model__depth": stats.randint(4, 10),
+            "model__l2_leaf_reg": stats.randint(1, 10),
+            "model__subsample": stats.uniform(0.6, 0.4),
+        }
+        grid_space = {
+            "model__iterations": [200],
+            "model__learning_rate": [0.03, 0.1],
+            "model__depth": [6, 8],
+        }
+
+    # 4) Sadece MODEL_DEFAULT_PARAMS'te bulunan parametreleri bırak
+    if model_name in MODEL_DEFAULT_PARAMS:
+        allowed = {f"model__{p}" for p in MODEL_DEFAULT_PARAMS[model_name].keys()}
+        random_space = {k: v for k, v in random_space.items() if k in allowed}
+        grid_space   = {k: v for k, v in grid_space.items()   if k in allowed}
+
+    # 5) Seçilen yönteme göre uzayı belirle
     selected_space = random_space if method == "Random Search" else grid_space
-    
-    # Not: Pipeline parametreleri "model__" prefix'i ile gelir, yukarıda düzelttim.
-    # Eğer parametre isimleri zaten "model__" ile başlıyorsa direkt kullanabiliriz.
     final_params = selected_space
 
+    # HPO yapılacak parametre kalmadıysa, direkt pipeline döndür
     if not final_params:
         return pipeline
 
-    st.write(f"⚙️ Tuning {model_name} with {method} ({'TimeSeries' if use_timesplit else 'KFold'})...")
-    search_engine = None
+    st.write(
+        f"⚙️ Tuning {model_name} with {method} "
+        f"({'TimeSeries' if use_timesplit else 'KFold'})..."
+    )
+
+    # 6) Random / Grid Search
     if method == "Random Search":
         search_engine = RandomizedSearchCV(
             estimator=pipeline,
             param_distributions=final_params,
             n_iter=20,
             cv=cv_strategy,
-            scoring='neg_mean_squared_error',
+            scoring="neg_mean_squared_error",
             random_state=42,
             n_jobs=-1,
-            verbose=0)
-    elif method == "Grid Search":
+            verbose=0,
+        )
+    else:
         search_engine = GridSearchCV(
             estimator=pipeline,
             param_grid=final_params,
             cv=cv_strategy,
-            scoring='neg_mean_squared_error',
+            scoring="neg_mean_squared_error",
             n_jobs=-1,
-            verbose=0)
-    if search_engine:
-        search_engine.fit(X_train, y_train)
-        return search_engine.best_estimator_
-    return pipeline
+            verbose=0,
+        )
+
+    search_engine.fit(X_train, y_train)
+    return search_engine.best_estimator_
+
 
 # -------------------------
 # Training & evaluation
