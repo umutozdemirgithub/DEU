@@ -139,6 +139,7 @@ MODEL_DEFAULT_PARAMS = {
         "subsample": 0.8,
     },
 }
+
 def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scaler_cls=None):
     """
     Seçilen model için, sadece MODEL_DEFAULT_PARAMS'te tanımlı hiperparametreler
@@ -296,7 +297,6 @@ def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scale
     search_engine.fit(X_train, y_train)
     return search_engine.best_estimator_
 
-
 # -------------------------
 # Training & evaluation
 # -------------------------
@@ -447,49 +447,63 @@ def _ensemble_anomaly_detector(resid, leverage, cooks_d):
     Xs = scaler.fit_transform(np.nan_to_num(X_feat))
 
     scores = np.zeros((n, 4))  # IF, LOF (neg), DBSCAN (outlier flag), 3sigma
+
     # IsolationForest
     try:
         if_model = IsolationForest(n_estimators=100, contamination=0.05, random_state=42)
         if_model.fit(Xs)
         if_score = -if_model.score_samples(Xs)
-        scores[:,0] = (if_score - if_score.min()) / (if_score.ptp() + 1e-9)
+        if_score = np.asarray(if_score, dtype=float)
+        scores[:, 0] = (if_score - if_score.min()) / (np.ptp(if_score) + 1e-9)
     except Exception:
-        scores[:,0] = 0
+        scores[:, 0] = 0
 
     # LOF
     try:
-        lof = LocalOutlierFactor(n_neighbors=max(5, min(50, int(n/5))), contamination=0.05, novelty=False)
+        lof = LocalOutlierFactor(
+            n_neighbors=max(5, min(50, int(n / 5))),
+            contamination=0.05,
+            novelty=False
+        )
         lof_pred = lof.fit_predict(Xs)
         lof_score = -lof.negative_outlier_factor_
-        scores[:,1] = (lof_score - lof_score.min()) / (lof_score.ptp() + 1e-9)
+        lof_score = np.asarray(lof_score, dtype=float)
+        scores[:, 1] = (lof_score - lof_score.min()) / (np.ptp(lof_score) + 1e-9)
     except Exception:
-        scores[:,1] = 0
+        scores[:, 1] = 0
 
     # DBSCAN
     try:
         db = DBSCAN(eps=0.8, min_samples=5)
         db_labels = db.fit_predict(Xs)
         db_flag = (db_labels == -1).astype(float)
-        scores[:,2] = db_flag
+        scores[:, 2] = db_flag
     except Exception:
-        scores[:,2] = 0
+        scores[:, 2] = 0
 
     # 3-sigma on residuals
     sigma = np.std(resid)
-    three_sigma_flag = (np.abs(resid) > 3 * sigma).astype(float)
-    scores[:,3] = three_sigma_flag
+    three_sigma_flag = (np.abs(resid) > 3 * sigma).astype(float) if sigma > 0 else np.zeros_like(resid, dtype=float)
+    scores[:, 3] = three_sigma_flag
 
     # aggregate: weighted sum
-    weights = np.array([0.4, 0.3, 0.15, 0.15])
+    weights = np.array([0.4, 0.3, 0.15, 0.15], dtype=float)
     agg = scores.dot(weights)
-    agg = (agg - agg.min()) / (agg.ptp() + 1e-9)
+    agg = np.asarray(agg, dtype=float)
 
-    labels = np.zeros_like(agg, dtype=int)
-    labels[agg >= 0.75] = 2  # strong
-    labels[(agg >= 0.4) & (agg < 0.75)] = 1  # medium
-    labels[agg < 0.4] = 0
+    # Güvenli normalizasyon
+    rng = np.ptp(agg)
+    if rng == 0:
+        norm_agg = np.zeros_like(agg)
+    else:
+        norm_agg = (agg - agg.min()) / (rng + 1e-9)
 
-    return agg, labels
+    labels = np.zeros_like(norm_agg, dtype=int)
+    labels[norm_agg >= 0.75] = 2      # strong
+    labels[(norm_agg >= 0.4) & (norm_agg < 0.75)] = 1  # medium
+    labels[norm_agg < 0.4] = 0       # normal
+
+    return norm_agg, labels
 
 def display_diagnostic_plots(
     y_test, y_pred, y_train=None, y_train_pred=None, 
