@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+from scipy.io import loadmat
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import plotly.express as px
@@ -11,7 +12,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, m
 from sklearn.inspection import permutation_importance
 from scipy import stats
 import shap
-from lime.lime_tabular import LimeTabularExplainer
+import dice_ml
 
 import streamlit.components.v1 as components
 import warnings
@@ -24,7 +25,6 @@ from sklearn.pipeline import Pipeline
 from sklearn.base import is_classifier
 
 from sklearn.neighbors import LocalOutlierFactor
-from sklearn.cluster import DBSCAN
 
 # Opsiyonel Kütüphaneler (Hata almamak için try-except blokları)
 try:
@@ -90,13 +90,66 @@ st.sidebar.title("AutoML Dashboard")
 
 @st.cache_data(ttl=3600)
 def load_data(uploaded_file):
-    """CSV dosyasını okur ve cache'ler."""
-    if uploaded_file is not None:
-        try:
-            return pd.read_csv(uploaded_file)
-        except Exception as e:
-            return None
-    return None
+    """
+    Reads the file uploaded by the user based on its extension.
+    Performs basic cleaning like dropping all-NaN columns and replacing infinities.
+    """
+    # Step 1: Get the file extension
+    file_extension = uploaded_file.name.split('.')[-1].lower()
+    df = None
+    
+    try:
+        # Step 2: Read the file based on its type
+        if file_extension in ['csv', 'txt']:
+            uploaded_file.seek(0) # Rewind the file buffer
+            df = pd.read_csv(uploaded_file, encoding='utf-8', on_bad_lines='skip')
+        
+        elif file_extension == 'xlsx':
+            df = pd.read_excel(uploaded_file)
+        
+        elif file_extension == 'mat':
+            mat_contents = loadmat(uploaded_file)
+            # Iterate through the .mat file to find the first large data array
+            for key in mat_contents:
+                if isinstance(mat_contents[key], np.ndarray) and mat_contents[key].ndim >= 2:
+                    df = pd.DataFrame(mat_contents[key])
+                    # Try to find matching column names
+                    potential_col_key = key + "_colnames"
+                    if potential_col_key in mat_contents and mat_contents[potential_col_key].shape[1] == df.shape[1]:
+                        df.columns = [str(c[0][0]) for c in mat_contents[potential_col_key]]
+                    else:
+                        df.columns = [f"col_{i}" for i in range(df.shape[1])]
+                    break
+            if df is None:
+                st.error("Could not find a suitable data matrix to process in the MAT file.")
+        
+        else:
+            st.error(f"Unsupported file type: .{file_extension}")
+
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
+        return None
+
+    # Step 3: Perform basic data cleaning
+    if df is not None:
+        # Ensure numeric types where possible
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='ignore')
+        
+        # Drop columns that are completely empty
+        original_cols = df.shape[1]
+        df.dropna(axis=1, how='all', inplace=True)
+        if df.shape[1] < original_cols:
+             st.warning(f"Dropped {original_cols - df.shape[1]} columns that were entirely empty.")
+        
+        # Replace infinite values (which break scalers) with NaN
+        inf_count = np.isinf(df.select_dtypes(include=np.number)).sum().sum()
+        if inf_count > 0:
+             st.warning(f"Replacing {inf_count} infinite values with NaN.")
+             df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+
+    return df
 
 @st.cache_data(show_spinner=False)
 def preprocess_dataframe(df, date_col_name=None):
@@ -803,7 +856,8 @@ def create_combined_radar(pfi_df, shap_df=None, top_k=10, title="PFI + SHAP Rada
 # -------------------------
 # Main XAI Runner
 # -------------------------
-def run_xai_analysis(model, X_train, X_test, y_test, methods, key_suffix, lime_sample=50, lime_num_features=12, radar_top_k=12):
+def run_xai_analysis(model, X_train, X_test, y_test, methods, key_suffix,
+                     lime_sample=50, lime_num_features=12, radar_top_k=12):
     if not methods:
         st.info("No XAI methods selected.")
         return
@@ -813,115 +867,495 @@ def run_xai_analysis(model, X_train, X_test, y_test, methods, key_suffix, lime_s
     estimator = model.named_steps['model'] if is_pipeline else model
 
     shap_imp_df = None
+    pfi_imp_df = None
+
+    # -------------------- SHAP --------------------
     if 'SHAP' in methods and shap is not None:
         with xai_tabs[methods.index('SHAP')]:
             st.markdown('## 🌈 SHAP Global & Local Explanations')
             try:
                 X_shap = X_test.iloc[:min(300,len(X_test))].copy()
                 if is_pipeline and 'scaler' in model.named_steps:
-                    try: X_shap = pd.DataFrame(model.named_steps['scaler'].transform(X_shap), columns=X_shap.columns, index=X_shap.index)
+                    try:
+                        X_shap = pd.DataFrame(model.named_steps['scaler'].transform(X_shap),
+                                              columns=X_shap.columns, index=X_shap.index)
                     except: pass
-                try: explainer = shap.TreeExplainer(estimator); shap_values = explainer.shap_values(X_shap)
-                except: explainer = shap.Explainer(estimator, X_shap); shap_values = explainer(X_shap)
+
+                # Explainer oluşturma
+                try:
+                    explainer = shap.TreeExplainer(estimator)
+                    shap_values = explainer.shap_values(X_shap)
+                except:
+                    explainer = shap.Explainer(estimator, X_shap)
+                    shap_values = explainer(X_shap)
+
                 shap_imp_df = shap_importance_df(shap_values, X_shap)
 
-                shap_tabs = st.tabs(['🎯 Summary Plot', '📊 Feature Importance', '🔎 Instance Waterfall'])
+                shap_tabs = st.tabs(['🎯 Summary Plot', '📊 Feature Importance', '🔎 Instance Waterfall', '⚡ Force Plot'])
+
+                # Summary Plot
                 with shap_tabs[0]:
                     fig, ax = plt.subplots(figsize=(7,5))
                     shap.summary_plot(shap_values, X_shap, show=False)
                     st.pyplot(fig)
 
+                # Feature Importance
                 with shap_tabs[1]:
                     st.dataframe(shap_imp_df)
-                    fig_imp = px.bar(shap_imp_df.head(20), x='Importance', y='Feature', orientation='h', title='Top SHAP Feature Importance')
+                    fig_imp = px.bar(shap_imp_df.head(20), x='Importance', y='Feature',
+                                     orientation='h', title='Top SHAP Feature Importance')
                     fig_imp.update_layout(template='plotly_white', height=450)
-                    # FIX: Unique key added
                     st.plotly_chart(fig_imp, use_container_width=True, key=f"shap_imp_{key_suffix}")
 
+                # Waterfall Plot
                 with shap_tabs[2]:
-                    idx_w = st.number_input('Select Instance Index', 0, len(X_shap)-1, 0, key=f'shap_w_input_{key_suffix}')
+                    idx_w = st.number_input('Select Instance Index', 0, len(X_shap)-1, 0,
+                                            key=f'shap_w_input_{key_suffix}')
                     vals = shap_values.values if hasattr(shap_values,'values') else shap_values
-                    if isinstance(vals,list): vals=np.array(vals[0])
-                    if vals.ndim==3: vals=vals[0]
+                    if isinstance(vals, list):
+                        vals = np.array(vals[0])
+                    if vals.ndim == 3:
+                        vals = vals[0]
                     df_w = pd.DataFrame({'Feature': X_shap.columns.tolist(), 'SHAP': vals[idx_w]})
                     df_w = df_w.sort_values('SHAP', key=np.abs, ascending=False).head(12)
-                    df_w['Contribution'] = df_w['SHAP'].cumsum() + float(explainer.expected_value if not isinstance(explainer.expected_value,(list,np.ndarray)) else explainer.expected_value[0])
-                    fig_w = px.bar(df_w, x='SHAP', y='Feature', orientation='h', title=f'SHAP Waterfall – Instance {idx_w}', color='SHAP')
+                    df_w['Contribution'] = df_w['SHAP'].cumsum() + float(
+                        explainer.expected_value if not isinstance(explainer.expected_value,(list,np.ndarray))
+                        else explainer.expected_value[0]
+                    )
+                    fig_w = px.bar(df_w, x='SHAP', y='Feature', orientation='h',
+                                   title=f'SHAP Waterfall – Instance {idx_w}', color='SHAP')
                     fig_w.update_layout(template='plotly_white', height=450)
-                    # FIX: Unique key added
                     st.plotly_chart(fig_w, use_container_width=True, key=f"shap_waterfall_{key_suffix}")
+
+                # ⚡ Force Plot
+                with shap_tabs[3]:
+                    idx_f = st.number_input('Select Instance for Force Plot', 0, len(X_shap)-1, 0,
+                                            key=f'shap_force_idx_{key_suffix}')
+
+                    vals = shap_values.values if hasattr(shap_values, 'values') else shap_values
+                    if isinstance(vals, list):
+                        vals = np.array(vals[0])
+                    if vals.ndim == 3:
+                        vals = vals[0]
+
+                    instance_shap = vals[idx_f]
+                    base_val = explainer.expected_value
+                    if isinstance(base_val, (list, np.ndarray)):
+                        base_val = float(base_val[0])
+
+                    force_plot = shap.force_plot(
+                        base_val,
+                        instance_shap,
+                        X_shap.iloc[idx_f, :],
+                        matplotlib=False
+                    )
+                    st_shap(force_plot, height=300)
+
+
             except Exception as e: st.error(f'SHAP Error: {e}')
 
-    pfi_imp_df = None
+    # -------------------- PFI --------------------
     if 'PFI' in methods:
         with xai_tabs[methods.index('PFI')]:
             st.markdown('## 🚀 Permutation Feature Importance (PFI)')
             try:
                 r = permutation_importance(estimator, X_test, y_test, n_repeats=15, random_state=42, n_jobs=-1)
                 idx = r.importances_mean.argsort()[::-1]
-                pfi_imp_df = pd.DataFrame({'Feature': X_test.columns[idx], 'Importance': r.importances_mean[idx], 'Std Dev': r.importances_std[idx]})
+                pfi_imp_df = pd.DataFrame({'Feature': X_test.columns[idx], 'Importance': r.importances_mean[idx],
+                                           'Std Dev': r.importances_std[idx]})
                 st.dataframe(pfi_imp_df)
-                fig_pfi = px.bar(pfi_imp_df.head(20), x='Importance', y='Feature', orientation='h', error_x='Std Dev', title='Top 20 PFI Features')
+                fig_pfi = px.bar(pfi_imp_df.head(20), x='Importance', y='Feature',
+                                 orientation='h', error_x='Std Dev', title='Top 20 PFI Features')
                 fig_pfi.update_layout(template='plotly_white', height=450)
-                # FIX: Unique key added
                 st.plotly_chart(fig_pfi, use_container_width=True, key=f"pfi_{key_suffix}")
             except Exception as e: st.error(f'PFI Error: {e}')
 
+    # -------------------- LIME --------------------
     if 'LIME' in methods:
         with xai_tabs[methods.index('LIME')]:
             st.markdown('## 💡 LIME Local Explanations (with aggregated table)')
-            if lime_tabular is None: st.warning('LIME is not installed.')
+            try:
+                explainer_lime = lime_tabular.LimeTabularExplainer(
+                    X_train.values, feature_names=X_train.columns.tolist(),
+                    mode='regression', discretize_continuous=True, verbose=False
+                )
+                idx = st.number_input('Select Test Instance', 0, len(X_test)-1, 0, key=f'lime_idx_{key_suffix}')
+                exp = explainer_lime.explain_instance(X_test.iloc[idx].values,
+                                                      lambda x:model.predict(x),
+                                                      num_features=lime_num_features)
+                if components is not None:
+                    components.html(exp.as_html(), height=450, scrolling=True)
+                else:
+                    st.write(exp.as_list())
+            except Exception as e: st.error(f'LIME Error: {e}')
+
+    # -------------------- Anchor Explanations --------------------
+    if 'Anchor' in methods:
+        with xai_tabs[methods.index('Anchor')]:
+            st.markdown("## 🪝 Anchor Explanations (PRO Edition)")
+
+            try:
+                from alibi.explainers import AnchorTabular
+            except ImportError:
+                st.error("`alibi` kütüphanesi eksik. `pip install alibi` ile yükleyin.")
             else:
                 try:
-                    explainer_lime = lime_tabular.LimeTabularExplainer(X_train.values, feature_names=X_train.columns.tolist(), mode='regression', discretize_continuous=True, verbose=False)
-                    idx = st.number_input('Select Test Instance', 0, len(X_test)-1, 0, key=f'lime_idx_{key_suffix}')
-                    exp = explainer_lime.explain_instance(X_test.iloc[idx].values, lambda x:model.predict(x), num_features=12)
-                    if components is not None: components.html(exp.as_html(), height=450, scrolling=True)
-                    else: st.write(exp.as_list())
-                    limedf = compute_lime_feature_importance(model, X_train, X_test, sample_size=lime_sample, num_features=lime_num_features)
-                    st.dataframe(limedf)
-                    fig_lime = px.bar(limedf.head(20), x='Mean Abs Weight', y='Feature', orientation='h', title='Top LIME Features (mean abs weight)')
-                    fig_lime.update_layout(template='plotly_white', height=450)
-                    # FIX: Unique key added
-                    st.plotly_chart(fig_lime, use_container_width=True, key=f"lime_{key_suffix}")
-                except Exception as e: st.error(f'LIME Error: {e}')
+                    feature_names = X_train.columns.tolist()
+                    X_train_np = X_train.values
+                    X_test_np = X_test.values
 
+                    predict_fn = lambda x: estimator.predict(x)
+
+                    explainer_anchor = AnchorTabular(
+                        predict_fn,
+                        feature_names=feature_names
+                    )
+                    explainer_anchor.fit(X_train_np)
+
+                    idx = st.number_input(
+                        "Select Test Instance for Anchor",
+                        0, len(X_test_np) - 1, 0,
+                        key=f"anchor_idx_{key_suffix}"
+                    )
+
+                    exp = explainer_anchor.explain(X_test_np[int(idx)])
+                    anchor_rules = list(exp.anchor)
+
+                    st.success(f"Anchor Rules Found: {anchor_rules}")
+
+                    # ============================================================
+                    # ALT SEKME YAPISI
+                    # ============================================================
+                    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+                        [
+                            "📌 Anchor Rules",
+                            "🌊 Precision & Coverage (Liquid Gauge)",
+                            "📈 Local Prediction + 3D Heatmap",
+                            "🌳 Decision Rule Tree",
+                            "📡 Neighborhood Stats"
+                        ]
+                    )
+
+                    # ============================================================
+                    # TAB 1 — Anchor Rules (Treemap + Bar)
+                    # ============================================================
+                    with tab1:
+                        df_anchor = pd.DataFrame({
+                            "Rule": anchor_rules,
+                            "Weight": [1.0] * len(anchor_rules)
+                        })
+
+                        st.markdown("### 📌 Anchor Rule Structure")
+
+                        c1, c2 = st.columns(2)
+
+                        with c1:
+                            fig_tree = px.treemap(
+                                df_anchor,
+                                path=["Rule"],
+                                values="Weight",
+                                title="Anchor Rule Treemap"
+                            )
+                            fig_tree.update_layout(height=450)
+                            st.plotly_chart(fig_tree, use_container_width=True)
+
+                        with c2:
+                            fig_bar = px.bar(
+                                df_anchor,
+                                x="Weight",
+                                y="Rule",
+                                orientation="h",
+                                title="Anchor Rule Strength"
+                            )
+                            fig_bar.update_layout(template="plotly_white", height=450)
+                            st.plotly_chart(fig_bar, use_container_width=True)
+
+                    # ============================================================
+                    # TAB 2 — Precision & Coverage Liquid Gauges
+                    # ============================================================
+                    with tab2:
+
+                        st.markdown("### 🌊 Liquid Gauge Visualization")
+
+                        def liquid_gauge(value, title):
+                            fig = {
+                                "data": [{
+                                    "type": "pie",
+                                    "values": [value, 1 - value],
+                                    "labels": ["Value", ""],
+                                    "hole": 0.7,
+                                    "textinfo": "none"
+                                }],
+                                "layout": {
+                                    "title": {"text": f"{title}: {value:.2f}", "x": 0.5},
+                                    "showlegend": False,
+                                }
+                            }
+                            return fig
+
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.plotly_chart(liquid_gauge(exp.precision, "Precision"), use_container_width=True)
+
+                        with col2:
+                            st.plotly_chart(liquid_gauge(exp.coverage, "Coverage"), use_container_width=True)
+
+                    # ============================================================
+                    # TAB 3 — Prediction + 3D Heatmap
+                    # ============================================================
+                    with tab3:
+                        pred_val = float(estimator.predict(X_test_np[[int(idx)]]))
+                        act_val = float(y_test.iloc[int(idx)])
+
+                        st.markdown("### 📈 Prediction Overview")
+                        c1, c2 = st.columns(2)
+                        c1.metric("Predicted Value", f"{pred_val:.4f}")
+                        c2.metric("Actual Value", f"{act_val:.4f}")
+
+                        st.markdown("### 🔥 3D Feature Heatmap")
+
+                        df_feat = pd.DataFrame(
+                            X_test_np[int(idx)].reshape(1, -1),
+                            columns=feature_names
+                        )
+
+                        fig3d = go.Figure(data=[go.Surface(
+                            z=[df_feat.values[0]],
+                            x=list(range(len(feature_names))),
+                            y=[0] * len(feature_names)
+                        )])
+
+                        fig3d.update_layout(
+                            title="3D Heatmap of Feature Values",
+                            scene=dict(
+                                xaxis_title="Feature Index",
+                                yaxis_title="Instance",
+                                zaxis_title="Value"
+                            ),
+                            height=550
+                        )
+
+                        st.plotly_chart(fig3d, use_container_width=True)
+
+                    # ============================================================
+                    # TAB 4 — Decision Rule Tree
+                    # ============================================================
+                    with tab4:
+                        st.markdown("### 🌳 Decision Rule Tree (Anchor Logic)")
+
+                        rule_tree_text = ""
+                        for i, r in enumerate(anchor_rules):
+                            rule_tree_text += f"{' ' * (i*3)}└── {r}\n"
+
+                        st.code(rule_tree_text, language="text")
+
+                    # ============================================================
+                    # TAB 5 — Neighborhood Stats
+                    # ============================================================
+                    with tab5:
+                        st.markdown("### 📡 Neighborhood Precision & Coverage")
+
+                        df_nei = pd.DataFrame({
+                            "Metric": ["Precision", "Coverage"],
+                            "Value": [exp.precision, exp.coverage]
+                        })
+
+                        fig_ns = px.bar(
+                            df_nei,
+                            x="Metric",
+                            y="Value",
+                            text="Value",
+                            title="Anchor Neighborhood Performance"
+                        )
+                        fig_ns.update_layout(template="plotly_white", height=450)
+                        st.plotly_chart(fig_ns, use_container_width=True)
+
+                except Exception as e:
+                    st.error(f"Anchor Error: {e}")
+
+
+    # -------------------- Counterfactual Explanations --------------------
+    if 'Counterfactual' in methods:
+        with xai_tabs[methods.index('Counterfactual')]:
+            st.markdown("## 🔄 Counterfactual Explanations (Advanced XAI Panel)")
+
+            try:
+
+                # 1️⃣ y_train var mı? Yoksa outcome otomatik oluştur
+                if 'y_train' in globals():
+                    df_dice = pd.concat([X_train.reset_index(drop=True),
+                                        y_train.reset_index(drop=True)], axis=1)
+                    outcome_col = y_train.name
+                else:
+                    outcome_col = "target"
+                    df_dice = X_train.copy()
+                    df_dice[outcome_col] = estimator.predict(X_train)
+
+                # 2️⃣ Model sınıflandırma mı/regresyon mu
+                is_classification = False
+                try:
+                    _ = estimator.predict_proba(X_test[:5])
+                    is_classification = True
+                except:
+                    is_classification = False
+
+                # 3️⃣ DiCE Data wrapper
+                data_dice = dice_ml.Data(
+                    dataframe=df_dice,
+                    continuous_features=X_train.columns.tolist(),
+                    outcome_name=outcome_col
+                )
+
+                # 4️⃣ Model wrapper
+                if is_classification:
+                    model_dice = dice_ml.Model(model=estimator, backend="sklearn")
+                else:
+                    model_dice = dice_ml.Model(model=estimator,
+                                            backend="sklearn",
+                                            model_type="regressor")
+
+                # 5️⃣ CF engine
+                exp = dice_ml.Dice(data_dice, model_dice, method="random")
+
+                # 6️⃣ Örnek seç
+                idx = st.number_input(
+                    "Select Test Instance",
+                    0, len(X_test) - 1, 0,
+                    key=f"cf_idx_{key_suffix}"
+                )
+                x0 = X_test.iloc[[idx]]
+                y0 = estimator.predict(x0)[0]
+
+                # 7️⃣ Regression ise desired_range
+                if not is_classification:
+                    delta = abs(y0) * 0.2 if y0 != 0 else 1
+                    desired_range = [y0 - delta, y0 + delta]
+                    cf = exp.generate_counterfactuals(
+                        x0, total_CFs=3, desired_range=desired_range
+                    )
+                else:
+                    cf = exp.generate_counterfactuals(
+                        x0, total_CFs=3, desired_class="opposite"
+                    )
+
+                cf_df = cf.cf_examples_list[0].final_cfs_df
+                original_df = x0.copy()
+                original_df["type"] = "Original"
+                cf_df["type"] = "CF"
+                merged_df = pd.concat([original_df, cf_df], ignore_index=True)
+
+                # 8️⃣ ALT TABLAR: Tabular, Heatmap, Radar, Minimal Change, Prediction Plot
+                tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                    "📄 Tabular View",
+                    "📊 Difference Heatmap",
+                    "🧭 Radar Plot",
+                    "🔧 Minimal Feature Change",
+                    "📈 CF Prediction Plot"
+                ])
+
+                # 📄 Tab 1: Counterfactual Table
+                with tab1:
+                    st.subheader("📄 Counterfactual Table")
+                    st.dataframe(cf_df)
+
+                # 📊 Tab 2: Difference Heatmap
+                with tab2:
+                    st.subheader("📊 Feature Differences (Original vs CF)")
+                    diff = cf_df[X_train.columns] - x0.values
+                    diff_df = diff.T.rename(columns={0: "Difference"})
+                    fig_diff = px.imshow(
+                        diff_df,
+                        color_continuous_scale="RdBu",
+                        title="Original – Counterfactual Feature Differences",
+                    )
+                    st.plotly_chart(fig_diff, use_container_width=True)
+
+                # 🧭 Tab 3: Radar Plot
+                with tab3:
+                    st.subheader("🧭 Feature Change Radar Chart")
+                    feat = X_train.columns.tolist()
+                    base_vals = x0.values.flatten()
+                    cf_vals = cf_df.iloc[0][feat].values
+                    fig_radar = go.Figure()
+                    fig_radar.add_trace(go.Scatterpolar(
+                        r=base_vals,
+                        theta=feat,
+                        fill='toself',
+                        name='Original'
+                    ))
+                    fig_radar.add_trace(go.Scatterpolar(
+                        r=cf_vals,
+                        theta=feat,
+                        fill='toself',
+                        name='Counterfactual'
+                    ))
+                    fig_radar.update_layout(
+                        polar=dict(radialaxis=dict(visible=True)),
+                        showlegend=True,
+                        title="Original vs Counterfactual Radar Comparison"
+                    )
+                    st.plotly_chart(fig_radar, use_container_width=True)
+
+                # 🔧 Tab 4: Minimal Feature Change
+                with tab4:
+                    st.subheader("🔧 Minimal Feature Changes")
+                    change_df = pd.DataFrame({
+                        "Feature": feat,
+                        "Original": base_vals,
+                        "Counterfactual": cf_vals,
+                        "Difference": cf_vals - base_vals
+                    }).sort_values(by="Difference", key=abs, ascending=False)
+                    st.dataframe(change_df)
+
+                # 📈 Tab 5: CF Prediction Plot
+                with tab5:
+                    st.subheader("📈 Original vs CF Prediction")
+                    y_orig = estimator.predict(x0)
+                    y_cf = estimator.predict(cf_df[feat])
+                    fig_pred = go.Figure()
+                    fig_pred.add_trace(go.Bar(name='Original', x=[0], y=[y_orig[0]]))
+                    fig_pred.add_trace(go.Bar(name='Counterfactual', x=[0], y=[y_cf[0]]))
+                    fig_pred.update_layout(title="Predicted Values Comparison", showlegend=True)
+                    st.plotly_chart(fig_pred, use_container_width=True)
+
+            except Exception as e:
+                st.error(f"Counterfactual Error: {e}")
+
+
+    # -------------------- Radar Chart --------------------
     if ('PFI' in methods or 'SHAP' in methods):
         try:
             with st.expander('📡 PFI + SHAP Combined Radar'):
                 shap_df = shap_imp_df if shap_imp_df is not None else None
-                fig_radar = create_combined_radar(pfi_imp_df if pfi_imp_df is not None else pd.DataFrame({'Feature':[], 'Importance':[]}), shap_df, top_k=radar_top_k)
-                # FIX: Unique key added
+                fig_radar = create_combined_radar(
+                    pfi_imp_df if pfi_imp_df is not None else pd.DataFrame({'Feature':[], 'Importance':[]}), 
+                    shap_df, top_k=radar_top_k
+                )
                 st.plotly_chart(fig_radar, use_container_width=True, key=f"radar_{key_suffix}")
         except Exception as e: st.error(f'Radar chart generation failed: {e}')
-
-    try:
-        with st.expander('🗂️ Automatic XAI Dashboard (Summary)'):
-            if pfi_imp_df is not None: st.table(pfi_imp_df.head(10))
-            if shap_imp_df is not None: st.table(shap_imp_df.head(10))
-            if 'LIME' in methods:
-                limedf_small = compute_lime_feature_importance(model, X_train, X_test, sample_size=min(30,len(X_test)), num_features=lime_num_features)
-                st.table(limedf_small.head(10))
-            if pfi_imp_df is not None and shap_imp_df is not None:
-                merged = pfi_imp_df[['Feature','Importance']].merge(shap_imp_df[['Feature','Importance']], on='Feature', how='outer', suffixes=('_PFI','_SHAP')).fillna(0)
-                merged['PFI_rank'] = merged['Importance_PFI'].rank(ascending=False)
-                merged['SHAP_rank'] = merged['Importance_SHAP'].rank(ascending=False)
-                merged['rank_diff'] = (merged['PFI_rank']-merged['SHAP_rank']).abs()
-                st.dataframe(merged.sort_values('rank_diff').head(20))
-    except: pass
 
     return {'pfi': pfi_imp_df, 'shap': shap_imp_df}
 
 # -------------------------
 # Multi-Model XAI Runner
 # -------------------------
-def run_models_xai(models: dict, X_train, X_test, y_test, methods=['SHAP','PFI','LIME'], key_prefix='model'):
+def run_models_xai(models: dict, X_train, X_test, y_test, 
+                   methods=['SHAP','PFI','LIME','Anchor','Counterfactual'], 
+                   key_prefix='model'):
+    """
+    Tüm modeller için seçilen XAI analizlerini çalıştırır.
+    Yeni eklenen yöntemler: Anchor ve Counterfactual
+    """
     results = {}
     for i, (name, m) in enumerate(models.items()):
         with st.expander(f"Model: {name}"):
-            st.markdown(f"## Model: {name}")
-            results[name] = run_xai_analysis(m, X_train, X_test, y_test, methods, key_suffix=f"{key_prefix}_{i}")
+            st.markdown(f"## 🧩 Model: {name}")
+            results[name] = run_xai_analysis(
+                m, X_train, X_test, y_test, methods, key_suffix=f"{key_prefix}_{i}"
+            )
     return results
+
 
 def run_dashboard(results, selected_diag_plots, xai_ops):
     if not results:
@@ -953,44 +1387,39 @@ def run_dashboard(results, selected_diag_plots, xai_ops):
         # --- Tab 2: Chart  ---
         with lb_tabs[1]:
             df_res = pd.DataFrame([{**{'Model': k}, **v['metrics']} for k, v in results.items()])
-            
+
             fig = go.Figure()
-            defined_colors = {
-                "MSE": "blue",
-                "RMSE": "red",
-                "MAE": "orange",
-                "MAPE": "purple",
-                "MedAE": "brown",
-                "R2": "green"
-            }
-            
+
             metrics_to_plot = [col for col in df_res.columns if col != 'Model' and col != 'R2']
 
             if not metrics_to_plot and "R2" not in df_res.columns:
                 st.warning("Grafik çizmek için hesaplanmış metrik bulunamadı.")
             else:
+                # Bar grafikleri (sol Y ekseni) - renk otomatik
                 for metric in metrics_to_plot:
                     fig.add_trace(go.Bar(
                         x=df_res['Model'],
                         y=df_res[metric],
                         name=metric,
-                        marker_color=defined_colors.get(metric, "#1f77b4"),
                         text=[f"{v:.4f}" for v in df_res[metric]],
-                        textposition="inside",
+                        textposition="outside",
                         insidetextanchor="middle",
-                        hovertemplate=f"<b>%{{x}}</b><br>{metric}: %{{y:.6f}}<extra></extra>"
+                        hovertemplate=f"<b>%{{x}}</b><br>{metric}: %{{y:.4f}}<extra></extra>",
+                        yaxis="y1"
                     ))
-                
+
+                # R2 trend (sağ Y ekseni) - boyutla vurgulama
                 if "R2" in df_res.columns:
                     min_size = 12
                     max_size = 30
                     r2_min = df_res["R2"].min()
                     r2_max = df_res["R2"].max()
+                    # Boyut skalası
                     if r2_max != r2_min:
                         sizes = min_size + (df_res["R2"] - r2_min) / (r2_max - r2_min) * (max_size - min_size)
                     else:
-                        sizes = [ (min_size + max_size)/2 ] * len(df_res)
-                    
+                        sizes = [(min_size + max_size)/2] * len(df_res)
+
                     fig.add_trace(go.Scatter(
                         x=df_res['Model'],
                         y=df_res["R2"],
@@ -998,27 +1427,34 @@ def run_dashboard(results, selected_diag_plots, xai_ops):
                         marker=dict(
                             symbol='star',
                             size=sizes,
-                            color=defined_colors.get("R2", "green"),
+                            color='green',  # R² sabit rengi
                             line=dict(width=1, color='black')
                         ),
-                        line=dict(color=defined_colors.get("R2", "green"), dash='dash', width=2),
+                        line=dict(color='green', dash='dash', width=2),
                         name="R2 Trend",
-                        hovertemplate="<b>%{x}</b><br>R2: %{y:.6f}<extra></extra>"
+                        hovertemplate="<b>%{x}</b><br>R2: %{y:.6f}<extra></extra>",
+                        yaxis="y2"
                     ))
 
+            # Layout ayarları
             fig.update_layout(
+                title="Leaderboard Metrics Comparison (Dual Y-Axis & R² Size)",
+                xaxis=dict(title="Model", tickangle=-45),
+                yaxis=dict(title="Metric Value", side="left"),
+                yaxis2=dict(title="R2 Value", overlaying="y", side="right"),
                 barmode='group',
-                title="Leaderboard Metrics Comparison",
-                xaxis_title="Model",
-                yaxis_title="Metric Value",
+                bargap=0.25,
+                bargroupgap=0.1,
                 template="plotly_white",
-                height=500,
+                height=550,
                 legend=dict(title="Metrics"),
                 hovermode="x unified"
             )
 
-            # FIX: Added unique key here to solve DuplicateElementId error
-            st.plotly_chart(fig, use_container_width=True, key="leaderboard_chart")
+            fig.update_traces(textfont_size=10)
+
+            st.plotly_chart(fig, use_container_width=True, key="leaderboard_chart_r2size")
+
 
         # --- Tab 3: Parameters  ---
         with lb_tabs[2]:
@@ -1145,11 +1581,9 @@ def run_dashboard(results, selected_diag_plots, xai_ops):
                     except Exception as e:
                         st.error(f"PDF Error: {e}")
 
-
 # -------------------------------------------------------------------------
 # 6. PDF REPORT GENERATOR
 # -------------------------------------------------------------------------
-
 def generate_pdf_report(results):
     buf = BytesIO()
     with PdfPages(buf) as pdf:
@@ -1201,11 +1635,9 @@ def generate_pdf_report(results):
 # -------------------------------------------------------------------------
 # 7. MAIN APP UI
 # -------------------------------------------------------------------------
-
 # -------------------------------------------------------------------------
 # SIDEBAR: MODERN UI & CONFIGURATION
 # -------------------------------------------------------------------------
-
 # 1. Custom CSS for better button and layout
 st.sidebar.markdown("""
     <style>
@@ -1242,6 +1674,7 @@ with st.sidebar.expander("📂 Veri Yükleme & Sütunlar", expanded=True):
     
     if uploaded_file:
         df_raw = load_data(uploaded_file)
+
         if df_raw is not None:
             st.success(f"✅ Yüklendi: {df_raw.shape[0]} satır, {df_raw.shape[1]} sütun")
             cols = df_raw.columns.tolist()
@@ -1298,7 +1731,11 @@ if df_raw is not None and feature_cols:
         available_plots = ["Adv. Scatter", "Residuals", "Distribution", "QQ Plot", "Influence", "Anomalies", "Overfitting Check"]
         selected_diag_plots = st.multiselect("Tanısal Grafikler", available_plots, default=["Adv. Scatter", "Overfitting Check"])
         
-        xai_ops = st.multiselect("Açıklanabilirlik (XAI)", ["SHAP", "PFI", "LIME"], help="Modelin 'neden' bu kararı verdiğini açıklar.")
+        xai_ops = st.multiselect(
+            "Açıklanabilirlik (XAI)", 
+            ["SHAP", "PFI", "LIME", "Anchor", "Counterfactual"], 
+            help="Modelin 'neden' bu kararı verdiğini açıklar."
+        )
 
     # --- ACTION BUTTON ---
     train_btn = st.sidebar.button("🚀 Analizi Başlat", type="primary")
