@@ -1835,10 +1835,11 @@ if train_btn and df_raw is not None:
     status_text.empty()
     st.rerun()
 
-# --- DISPLAY LOGIC ---
-if st.session_state["results"]:
-    results = st.session_state["results"]
-    run_dashboard(results, selected_diag_plots, xai_ops)
+    # --- DISPLAY LOGIC ---
+    if st.session_state["results"]:
+        results = st.session_state["results"]
+        run_dashboard(results, selected_diag_plots, xai_ops)
+
 
 
 
