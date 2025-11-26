@@ -14,8 +14,7 @@ from scipy import stats
 import shap
 import dice_ml
 from lime.lime_tabular import LimeTabularExplainer
-from alibi.explaners import AnchorTabular
-
+from alibi.explainers import AnchorTabular
 import streamlit.components.v1 as components
 import warnings
 import statsmodels.api as sm
@@ -1840,5 +1839,6 @@ if train_btn and df_raw is not None:
 if st.session_state["results"]:
     results = st.session_state["results"]
     run_dashboard(results, selected_diag_plots, xai_ops)
+
 
 
