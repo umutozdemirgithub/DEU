@@ -5,12 +5,12 @@ scipy
 matplotlib
 plotly
 scikit-learn
-shap
-dice-ml
 statsmodels
-streamlit-plotly-events
+shap
+lime
+alibi
+dice-ml
 xgboost
 lightgbm
 catboost
-lime
-alibi
+openpyxl
