@@ -5,52 +5,92 @@ from scipy.io import loadmat
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import plotly.express as px
+
+# --- SKLEARN MODEL SELECTION ---
 from sklearn.model_selection import train_test_split, RandomizedSearchCV, GridSearchCV, TimeSeriesSplit
-from sklearn.ensemble import HistGradientBoostingRegressor, IsolationForest, GradientBoostingRegressor, RandomForestRegressor
 
-from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet, HuberRegressor
+# --- SKLEARN MODELS (ENSEMBLE) ---
+from sklearn.ensemble import (
+    HistGradientBoostingRegressor, 
+    GradientBoostingRegressor, 
+    RandomForestRegressor, 
+    AdaBoostRegressor, 
+    ExtraTreesRegressor,
+    IsolationForest
+)
+
+# --- SKLEARN MODELS (LINEAR, BAYESIAN & ROBUST) ---
+from sklearn.linear_model import (
+    LinearRegression, 
+    Ridge, 
+    Lasso, 
+    ElasticNet, 
+    HuberRegressor,
+    SGDRegressor, 
+    BayesianRidge, 
+    ARDRegression, 
+    TheilSenRegressor, 
+    RANSACRegressor,
+    PassiveAggressiveRegressor
+)
+
+# --- SKLEARN MODELS (SVM) ---
+from sklearn.svm import SVR, LinearSVR, NuSVR
+
+# --- SKLEARN MODELS (OTHERS: TREE, NEIGHBORS, NN, GAUSSIAN) ---
 from sklearn.tree import DecisionTreeRegressor
-from sklearn.ensemble import ExtraTreesRegressor
-from sklearn.svm import SVR
-from sklearn.neighbors import KNeighborsRegressor
+from sklearn.neighbors import KNeighborsRegressor, LocalOutlierFactor
 from sklearn.neural_network import MLPRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
 
+# --- PREPROCESSING & METRICS ---
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler, MaxAbsScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error, median_absolute_error
+from sklearn.metrics import (
+    mean_squared_error, mean_absolute_error, r2_score, 
+    mean_absolute_percentage_error, median_absolute_error,
+    explained_variance_score, max_error, mean_squared_log_error
+)
 from sklearn.inspection import permutation_importance
-from scipy import stats
-import shap
-# from lime.lime_tabular import LimeTabularExplainer # Optional
-from alibi.explainers import AnchorTabular
-import dice_ml
+from sklearn.pipeline import Pipeline
 
-import streamlit.components.v1 as components
-import warnings
+# --- UTILS & STATS ---
+from scipy import stats
 import statsmodels.api as sm
 from scipy.stats import gaussian_kde, probplot
+import warnings
+import time
 from io import BytesIO
 from matplotlib.backends.backend_pdf import PdfPages
-import time
-from sklearn.pipeline import Pipeline
-from sklearn.neighbors import LocalOutlierFactor
+
+import shap
+import dice_ml
+try:
+    from alibi.explainers import AnchorTabular
+except ImportError:
+    AnchorTabular = None
+
+import streamlit.components.v1 as components
 
 import config
 
 try:
     from xgboost import XGBRegressor
-except Exception:
+except ImportError:
     XGBRegressor = None
+
 try:
     from lightgbm import LGBMRegressor
-except Exception:
+except ImportError:
     LGBMRegressor = None
+
 try:
     from catboost import CatBoostRegressor
-except Exception:
+except ImportError:
     CatBoostRegressor = None
+
 try:
     from lime import lime_tabular
-except Exception:
+except ImportError:
     lime_tabular = None
 
 warnings.filterwarnings("ignore")
@@ -502,6 +542,7 @@ def safe_model_factory(name, random_state=config.DATA_CONFIG['random_state']):
     if 'random_state' in defaults:
         defaults.pop('random_state')
     
+    # --- TREE & ENSEMBLE ---
     if name == "HistGradientBoosting":
         return HistGradientBoostingRegressor(random_state=random_state, **defaults)
     elif name == "RandomForest":
@@ -510,21 +551,20 @@ def safe_model_factory(name, random_state=config.DATA_CONFIG['random_state']):
         return GradientBoostingRegressor(random_state=random_state, **defaults)
     elif name == "ExtraTrees":
         return ExtraTreesRegressor(random_state=random_state, **defaults)
+    elif name == "AdaBoost":
+        return AdaBoostRegressor(random_state=random_state, **defaults)
+    
     elif name == "XGBoost":
-        if XGBRegressor is None: 
-            st.warning("XGBoost not installed. pip install xgboost")
-            return None  
+        if XGBRegressor is None: return None  
         return XGBRegressor(random_state=random_state, **defaults)
     elif name == "LightGBM":
-        if LGBMRegressor is None:
-            st.warning("LightGBM not installed. pip install lightgbm")
-            return None
+        if LGBMRegressor is None: return None
         return LGBMRegressor(random_state=random_state, **defaults)
     elif name == "CatBoost":
-        if CatBoostRegressor is None:
-            st.warning("CatBoost not installed. pip install catboost")
-            return None
+        if CatBoostRegressor is None: return None
         return CatBoostRegressor(random_state=random_state, **defaults)
+    
+    # --- LINEAR & REGULARIZED ---
     elif name == "LinearRegression":
         return LinearRegression(**defaults)
     elif name == "Ridge":
@@ -533,18 +573,41 @@ def safe_model_factory(name, random_state=config.DATA_CONFIG['random_state']):
         return Lasso(random_state=random_state, **defaults)
     elif name == "ElasticNet":
         return ElasticNet(random_state=random_state, **defaults)
+    elif name == "SGDRegressor":
+        return SGDRegressor(random_state=random_state, **defaults)
     elif name == "HuberRegressor":
-        return HuberRegressor(**defaults)
-    elif name == "DecisionTree":
-        return DecisionTreeRegressor(random_state=random_state, **defaults)
+        return HuberRegressor(**defaults) 
+        
+    # --- BAYESIAN & ROBUST ---
+    elif name == "BayesianRidge":
+        return BayesianRidge(**defaults)
+    elif name == "ARDRegression":
+        return ARDRegression(**defaults)
+    elif name == "TheilSenRegressor":
+        return TheilSenRegressor(random_state=random_state, **defaults)
+    elif name == "RANSACRegressor":
+        return RANSACRegressor(random_state=random_state, **defaults)
+
+    # --- SVM ---
     elif name == "SVR":
         return SVR(**defaults)
+    elif name == "LinearSVR":
+        return LinearSVR(random_state=random_state, **defaults)
+    elif name == "NuSVR":
+        return NuSVR(**defaults)
+
+    # --- OTHERS ---
+    elif name == "GaussianProcessRegressor":
+        return GaussianProcessRegressor(random_state=random_state, **defaults)
+    elif name == "DecisionTree":
+        return DecisionTreeRegressor(random_state=random_state, **defaults)
     elif name == "KNeighborsRegressor":
         return KNeighborsRegressor(**defaults)
     elif name == "MLPRegressor":
         return MLPRegressor(random_state=random_state, **defaults)
+    
     else:
-        st.warning(f"Model '{name}' not found. Using HistGradientBoosting.")
+        st.warning(f"Model '{name}' is not defined in the factory. Using default (HistGradient).")
         return HistGradientBoostingRegressor(random_state=random_state)
 
 def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scaler_cls=None):
@@ -667,16 +730,71 @@ def train_and_evaluate(X, y, test_size, model_name, hpo_method=None, use_timespl
     y_train_pred = model.predict(X_train)
 
     # 7. METRICS
+# 7. METRICS (English Version)
     metrics = {}
     if active_metrics is None:
         active_metrics = config.METRICS_CONFIG["defaults"]
 
-    if "MSE" in active_metrics: metrics['MSE'] = mean_squared_error(y_test, y_pred)
-    if "RMSE" in active_metrics: metrics['RMSE'] = np.sqrt(mean_squared_error(y_test, y_pred))
-    if "MAE" in active_metrics: metrics['MAE'] = mean_absolute_error(y_test, y_pred)
-    if "R2" in active_metrics: metrics['R2'] = r2_score(y_test, y_pred)
-    if "MAPE" in active_metrics: metrics['MAPE'] = mean_absolute_percentage_error(y_test, y_pred)
-    if "MedAE" in active_metrics: metrics['MedAE'] = median_absolute_error(y_test, y_pred)
+    # --- Basic Metrics ---
+    if "MSE" in active_metrics: 
+        metrics['MSE'] = mean_squared_error(y_test, y_pred)
+    
+    if "RMSE" in active_metrics: 
+        metrics['RMSE'] = np.sqrt(mean_squared_error(y_test, y_pred))
+    
+    if "MAE" in active_metrics: 
+        metrics['MAE'] = mean_absolute_error(y_test, y_pred)
+    
+    # --- R2 and Derivatives ---
+    r2_val = r2_score(y_test, y_pred)
+    if "R2" in active_metrics: 
+        metrics['R2'] = r2_val
+    
+    if "Adj_R2" in active_metrics:
+        # Adjusted R2 Formula: 1 - (1-R2) * (n-1)/(n-p-1)
+        n = len(y_test)
+        p = X_test.shape[1]
+        if n > p + 1:
+            metrics['Adj_R2'] = 1 - (1 - r2_val) * (n - 1) / (n - p - 1)
+        else:
+            metrics['Adj_R2'] = r2_val # Return normal R2 if data is insufficient for adjustment
+
+    # --- Error Distribution Metrics ---
+    if "ExpVar" in active_metrics:
+        metrics['ExpVar'] = explained_variance_score(y_test, y_pred)
+
+    if "MAPE" in active_metrics: 
+        metrics['MAPE'] = mean_absolute_percentage_error(y_test, y_pred)
+
+    if "MedAE" in active_metrics: 
+        metrics['MedAE'] = median_absolute_error(y_test, y_pred)
+        
+    if "MaxErr" in active_metrics:
+        metrics['MaxErr'] = max_error(y_test, y_pred)
+
+    # --- Logarithmic Errors (Safe Calculation) ---
+    if "MSLE" in active_metrics or "RMSLE" in active_metrics:
+        # Rule 1: Actual values (y_test) must NEVER be negative for log metrics.
+        if (y_test < 0).any():
+            # If actual data contains negatives, log error is mathematically impossible.
+            if "MSLE" in active_metrics: metrics['MSLE'] = None
+            if "RMSLE" in active_metrics: metrics['RMSLE'] = None
+        else:
+            # Rule 2: If predictions (y_pred) are negative, clip them to 0.
+            # This prevents crashes if the model predicts slightly negative values (e.g. -0.01).
+            y_pred_safe = np.maximum(y_pred, 0)
+            
+            try:
+                msle_val = mean_squared_log_error(y_test, y_pred_safe)
+                
+                if "MSLE" in active_metrics: 
+                    metrics['MSLE'] = msle_val
+                if "RMSLE" in active_metrics: 
+                    metrics['RMSLE'] = np.sqrt(msle_val)
+            except ValueError:
+                # Return None in case of unexpected errors
+                if "MSLE" in active_metrics: metrics['MSLE'] = None
+                if "RMSLE" in active_metrics: metrics['RMSLE'] = None
 
     if _progress_callback: _progress_callback(100)
 
@@ -1439,6 +1557,7 @@ def run_dashboard(results, selected_diag_plots, xai_ops):
 
             st.plotly_chart(fig, use_container_width=True, key="leaderboard_chart_r2size")
 
+
         with lb_tabs[2]:
             param_list = []
             for m_name, res in results.items():
@@ -1452,11 +1571,17 @@ def run_dashboard(results, selected_diag_plots, xai_ops):
                     for k in config.MODEL_DEFAULT_PARAMS[base_name].keys():
                         if k in params:
                             disp_name = config.UNIFIED_PARAM_NAMES.get(k, k)
-                            row[disp_name] = params[k]
+                            
+                            val = params[k]
+                            if isinstance(val, (tuple, list)):
+                                row[disp_name] = str(val)
+                            else:
+                                row[disp_name] = val
+                            
                 param_list.append(row)
             
             if param_list:
-                st.dataframe(pd.DataFrame(param_list).fillna("-"), use_container_width=True)
+                st.dataframe(pd.DataFrame(param_list).fillna("-").astype(str), use_container_width=True)
 
     with st.expander("### 📊 Visualization"):
         model_tabs = st.tabs(list(results.keys()))
@@ -1662,24 +1787,43 @@ if df_raw is not None and feature_cols:
             time.sleep(0.5)
             st.rerun()
 
-# -----------------------------
-# --- SECTION 3: MODELING ---
-# -----------------------------
+    # -----------------------------
+    # --- SECTION 3: MODELING ---
+    # -----------------------------
     st.sidebar.header("3️⃣ Modeling")
 
     with st.sidebar.expander("🧠 Models & Parameters", expanded=False):
-        avail_models = ["HistGradientBoosting", "RandomForest", "GradientBoosting"]
-        if 'XGBRegressor' in globals(): avail_models.append("XGBoost")
-        if 'LGBMRegressor' in globals(): avail_models.append("LightGBM")
-        if 'CatBoostRegressor' in globals(): avail_models.append("CatBoost")
+        st.info("Select models from different families below:")
         
-        selected_models = st.multiselect(
-            "Select Models", 
-            config.AVAILABLE_MODELS, 
-            default=["HistGradientBoosting"],
-            help="Pick one or more models to train."
-        )
+        selected_models = []
+        
+        for group_name, models_in_group in config.MODEL_GROUPS.items():
+            
+            available_in_group = []
+            for m in models_in_group:
+                if m == "XGBoost" and (XGBRegressor is None): continue
+                if m == "LightGBM" and (LGBMRegressor is None): continue
+                if m == "CatBoost" and (CatBoostRegressor is None): continue
+                available_in_group.append(m)
+            
+            if available_in_group:
+                defaults = ["HistGradientBoosting"] if "HistGradientBoosting" in available_in_group else []
+                
+                st.markdown(f"**📌 {group_name}**")
+                
+                current_selection = st.multiselect(
+                    f"Choose {group_name}", 
+                    available_in_group, 
+                    default=defaults,
+                    key=f"multiselect_{group_name}", 
+                    label_visibility="collapsed" 
+                )
+                selected_models.extend(current_selection)
 
+        if not selected_models:
+            st.warning("⚠️ Please select at least one model to proceed.")
+
+        st.markdown("---")
         st.markdown("**⚙️ Advanced Settings**")
         hpo_ops = st.multiselect(
             "Hyperparameter Optimization", 

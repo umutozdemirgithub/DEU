@@ -28,27 +28,42 @@ DATA_CONFIG = {
 # 3. MODELS AND DEFAULT PARAMETERS
 # =============================================================================
 MODEL_GROUPS = {
-    "Boosting & Bagging": [
+    "Tree & Ensemble (Boosting/Bagging)": [
         "HistGradientBoosting", 
         "RandomForest", 
         "GradientBoosting", 
         "XGBoost", 
         "LightGBM", 
         "CatBoost",
-        "ExtraTrees"
+        "ExtraTrees",
+        "AdaBoost"  
     ],
     "Linear & Regularized": [
         "LinearRegression",
         "Ridge",
         "Lasso",
         "ElasticNet",
-        "HuberRegressor"
+        "SGDRegressor" 
     ],
-    "Others": [
-        "DecisionTree",
+    "Bayesian & Robust": [
+        "BayesianRidge",  
+        "ARDRegression",   
+        "HuberRegressor",
+        "TheilSenRegressor", 
+        "RANSACRegressor"    
+    ],
+    "Support Vector Machines": [
         "SVR",
+        "LinearSVR", 
+        "NuSVR"      
+    ],
+    "Neighbors & Gaussian": [
         "KNeighborsRegressor",
-        "MLPRegressor"
+        "GaussianProcessRegressor" 
+    ],
+    "Neural Networks & Others": [
+        "MLPRegressor",
+        "DecisionTree"
     ]
 }
 
@@ -78,7 +93,38 @@ MODEL_DEFAULT_PARAMS = {
         "iterations": 300, "learning_rate": 0.05, "depth": 6, 
         "l2_leaf_reg": 3.0, "subsample": 0.8, "verbose": 0, "allow_writing_files": False
     },
-
+    "AdaBoost": {
+        "n_estimators": 50, "learning_rate": 1.0, "loss": "linear", "random_state": 42
+    },
+    "SGDRegressor": {
+        "loss": "squared_error", "penalty": "l2", "alpha": 0.0001, 
+        "max_iter": 1000, "tol": 1e-3, "random_state": 42
+    },
+    "BayesianRidge": {
+        "max_iter": 300, 
+        "tol": 1e-3, 
+        "alpha_1": 1e-6, "alpha_2": 1e-6, "lambda_1": 1e-6, "lambda_2": 1e-6
+    },
+    "ARDRegression": {
+        "max_iter": 300, 
+        "tol": 1e-3, 
+        "alpha_1": 1e-6, "alpha_2": 1e-6, "lambda_1": 1e-6, "lambda_2": 1e-6
+    },
+    "TheilSenRegressor": {
+        "max_subpopulation": 10000, "random_state": 42, "n_jobs": -1
+    },
+    "RANSACRegressor": {
+        "min_samples": None, "residual_threshold": None, "random_state": 42
+    },
+    "LinearSVR": {
+        "epsilon": 0.0, "tol": 1e-4, "C": 1.0, "loss": "epsilon_insensitive", "random_state": 42
+    },
+    "NuSVR": {
+        "nu": 0.5, "C": 1.0, "kernel": "rbf", "gamma": "scale"
+    },
+    "GaussianProcessRegressor": {
+        "alpha": 1e-10, "normalize_y": True, "random_state": 42
+    },
     "LinearRegression": {
         "fit_intercept": True, "n_jobs": -1
     },
@@ -200,6 +246,56 @@ HPO_SPACES = {
             "model__n_estimators": [100, 300],
             "model__learning_rate": [0.01, 0.1],
             "model__max_depth": [3, 6],
+        }
+    },
+    "AdaBoost": {
+        "random": {
+            "model__n_estimators": stats.randint(50, 500),
+            "model__learning_rate": stats.loguniform(0.01, 2.0),
+            "model__loss": ["linear", "square", "exponential"]
+        },
+        "grid": {
+            "model__n_estimators": [50, 100, 200],
+            "model__learning_rate": [0.1, 1.0],
+        }
+    },
+    "SGDRegressor": {
+        "random": {
+            "model__alpha": stats.loguniform(1e-5, 1e-1),
+            "model__penalty": ["l2", "l1", "elasticnet"],
+            "model__learning_rate": ["constant", "optimal", "invscaling"]
+        },
+        "grid": {
+            "model__alpha": [0.0001, 0.01],
+            "model__penalty": ["l2", "elasticnet"]
+        }
+    },
+    "BayesianRidge": {
+        "random": {
+            "model__alpha_1": stats.loguniform(1e-7, 1e-5),
+            "model__lambda_1": stats.loguniform(1e-7, 1e-5)
+        },
+        "grid": {
+            "model__alpha_1": [1e-6, 1e-5],
+            "model__lambda_1": [1e-6, 1e-5]
+        }
+    },
+    "LinearSVR": {
+        "random": {
+            "model__C": stats.loguniform(0.1, 100),
+            "model__epsilon": stats.uniform(0, 1)
+        },
+        "grid": {
+            "model__C": [0.1, 1.0, 10.0],
+            "model__epsilon": [0, 0.1]
+        }
+    },
+    "GaussianProcessRegressor": {
+        "random": {
+            "model__alpha": stats.loguniform(1e-10, 1e-2)
+        },
+        "grid": {
+            "model__alpha": [1e-10, 1e-5, 1e-2]
         }
     },
     "LightGBM": {
@@ -328,7 +424,22 @@ HPO_SPACES = {
 # =============================================================================
 # 5. METRICS AND PLOTS
 # =============================================================================
-METRICS_CONFIG = {"available": ["MSE", "RMSE", "MAE", "R2", "MAPE", "MedAE"],"defaults": ["MSE", "RMSE", "R2"]}
+METRICS_CONFIG = {
+    "available": [
+        "MSE", 
+        "RMSE", 
+        "MAE", 
+        "R2", 
+        "Adj_R2",          
+        "MAPE", 
+        "MedAE", 
+        "MaxErr",           
+        "ExpVar",           
+        "MSLE",             
+        "RMSLE"             
+    ],
+    "defaults": ["MSE", "RMSE", "R2", "Adj_R2"]
+}
 
 DIAGNOSTIC_PLOTS = ["Advanced Scatter", "Residuals", "Distribution", "QQ Plot", "Influence", "Anomalies", "Overfitting Check"]
 
