@@ -1,11 +1,12 @@
 streamlit
 pandas
 numpy
+scipy
 matplotlib
 plotly
 scikit-learn
-scipy
 shap
+dice-ml
 statsmodels
 streamlit-plotly-events
 xgboost
