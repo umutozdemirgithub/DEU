@@ -66,6 +66,8 @@ import plotly.io as pio
 
 from matplotlib.backends.backend_pdf import PdfPages
 import plotly.figure_factory as ff
+import random
+from sklearn.base import clone
 
 import io
 import matplotlib.image as mpimg
@@ -685,6 +687,193 @@ def get_optuna_params(trial, model_name):
         
     return params
 
+class ABCHyperparameterOptimizer:
+    """
+    Artificial Bee Colony (ABC) based hyperparameter optimization class 
+    for Scikit-learn models.
+    (Final Reinforced Version: Error-protected and Guaranteed Fit feature)
+    """
+    def __init__(self, estimator, param_distributions, cv, scoring="neg_mean_squared_error", 
+                 n_population=10, max_iter=10):
+        self.estimator = estimator
+        self.base_estimator_ = clone(estimator) 
+        self.param_dist = param_distributions
+        self.cv = cv
+        self.scoring = scoring
+        self.n_pop = n_population
+        self.max_iter = max_iter
+        self.limit = max_iter // 2
+        
+    def _get_random_params(self):
+        """Draws a random set of parameters from Scipy distributions."""
+        params = {}
+        for k, v in self.param_dist.items():
+            if hasattr(v, "rvs"):
+                val = v.rvs()
+                if isinstance(val, (np.integer, np.int64, np.int32)):
+                    val = int(val)
+                params[k] = val
+            elif isinstance(v, list):
+                params[k] = random.choice(v)
+            else:
+                params[k] = v
+        return params
+
+    def _mutate_params(self, current_params, neighbor_params):
+        new_params = current_params.copy()
+        for k, v in current_params.items():
+            # Numerical Values (excluding Bool)
+            if isinstance(v, (int, float, np.number)) and not isinstance(v, bool):
+                phi = random.uniform(-1, 1)
+                neighbor_val = neighbor_params[k]
+                
+                # If neighbor value is None (e.g., max_depth=None), skip mutation
+                if neighbor_val is None:
+                    new_params[k] = v
+                    continue
+
+                new_val = v + phi * (v - neighbor_val)
+                
+                # Integer Constraint
+                if isinstance(v, (int, np.integer)):
+                    new_val = int(round(abs(new_val)))
+                    # For parameters that shouldn't be 0 (e.g., n_estimators, max_depth)
+                    # Generally, tree parameters must be at least 1 or 2.
+                    if new_val < 1: new_val = 1
+                else:
+                    new_val = abs(new_val) # If Float, make positive
+                
+                new_params[k] = new_val
+            
+            # Categorical or None Values
+            else:
+                if random.random() < 0.5:
+                    new_params[k] = neighbor_params[k]
+                else:
+                    if hasattr(self.param_dist[k], "rvs"):
+                        val = self.param_dist[k].rvs()
+                        if isinstance(val, (np.integer, np.int64)): val = int(val)
+                        new_params[k] = val
+                    elif isinstance(self.param_dist[k], list):
+                        new_params[k] = random.choice(self.param_dist[k])
+                        
+        return new_params
+
+    def fit(self, X, y):
+        population = []
+        
+        # 1. Initial Population
+        for _ in range(self.n_pop):
+            params = self._get_random_params()
+            score = self._evaluate(params, X, y)
+            population.append({'params': params, 'score': score, 'trial': 0})
+            
+        self.best_solution_ = max(population, key=lambda x: x['score'])
+        
+        # 2. Main Loop
+        for i in range(self.max_iter):
+            # --- EMPLOYED BEES ---
+            for j in range(self.n_pop):
+                current = population[j]
+                idxs = list(range(self.n_pop))
+                idxs.remove(j)
+                neighbor = population[random.choice(idxs)]
+                
+                new_params = self._mutate_params(current['params'], neighbor['params'])
+                new_score = self._evaluate(new_params, X, y)
+
+                if new_score > current['score']:
+                    population[j] = {'params': new_params, 'score': new_score, 'trial': 0}
+                else:
+                    population[j]['trial'] += 1
+
+            # --- ONLOOKER BEES ---
+            scores = [p['score'] for p in population]
+            valid_scores = [s for s in scores if s != -float('inf')]
+            if not valid_scores:
+                min_s, max_s = -1.0, 0.0
+            else:
+                min_s, max_s = min(valid_scores), max(valid_scores)
+            
+            probs = []
+            if max_s == min_s: 
+                 probs = [1.0/self.n_pop] * self.n_pop
+            else:
+                for s in scores:
+                    if s == -float('inf'): probs.append(0.0)
+                    else: probs.append((s - min_s) / (max_s - min_s + 1e-9))
+
+            if sum(probs) == 0: probs = [1.0/self.n_pop] * self.n_pop
+
+            for _ in range(self.n_pop):
+                try:
+                    j = random.choices(range(self.n_pop), weights=probs, k=1)[0]
+                except:
+                    j = random.choice(range(self.n_pop))
+
+                current = population[j]
+                idxs = list(range(self.n_pop))
+                idxs.remove(j)
+                neighbor = population[random.choice(idxs)]
+                
+                new_params = self._mutate_params(current['params'], neighbor['params'])
+                new_score = self._evaluate(new_params, X, y)
+                    
+                if new_score > current['score']:
+                    population[j] = {'params': new_params, 'score': new_score, 'trial': 0}
+                else:
+                    population[j]['trial'] += 1
+
+            # --- SCOUT BEES ---
+            for j in range(self.n_pop):
+                if population[j]['trial'] > self.limit:
+                    params = self._get_random_params()
+                    score = self._evaluate(params, X, y)
+                    population[j] = {'params': params, 'score': score, 'trial': 0}
+
+            current_best = max(population, key=lambda x: x['score'])
+            if current_best['score'] > self.best_solution_['score']:
+                self.best_solution_ = current_best
+
+        # 3. FINAL MODEL TRAINING (SAFE MODE)
+        try:
+            # If a valid solution is found, use it
+            if self.best_solution_['score'] != -float('inf'):
+                self.estimator.set_params(**self.best_solution_['params'])
+                self.best_estimator_ = self.estimator
+                self.best_estimator_.fit(X, y)
+            else:
+                # If no solution is found (all failed), revert to default
+                st.warning("⚠️ ABC Optimization could not find valid parameters. Using default model.")
+                self.best_estimator_ = clone(self.base_estimator_)
+                self.best_estimator_.fit(X, y)
+                
+        except Exception as e:
+            # If training still fails with best parameters (e.g., data size issue)
+            st.warning(f"⚠️ ABC could not be trained with best parameters ({str(e)}). Reverting to default settings.")
+            try:
+                self.best_estimator_ = clone(self.base_estimator_)
+                self.best_estimator_.fit(X, y)
+            except Exception as e2:
+                st.error(f"❌ Critical Error: Model could not be trained even with default settings: {e2}")
+                # In the worst-case scenario, leave the current estimator as is (to avoid returning None)
+                self.best_estimator_ = self.estimator 
+
+        return self
+
+    def _evaluate(self, params, X, y):
+        try:
+            # Clone the model so the original is not corrupted
+            est = clone(self.estimator)
+            est.set_params(**params)
+            scores = cross_val_score(est, X, y, cv=self.cv, scoring=self.scoring, n_jobs=-1)
+            return scores.mean()
+        except Exception:
+            return -float('inf')
+
+    def predict(self, X):
+        return self.best_estimator_.predict(X)
+
 def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scaler_cls=None):
     # 1) Base Model & Pipeline Setup
     base_model = safe_model_factory(model_name)
@@ -701,6 +890,30 @@ def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scale
         cv_strategy = 3
 
     # =========================================================
+    # ARTIFICIAL BEE COLONY BLOĞU
+    # =========================================================
+    if method == "Artificial Bee Colony":
+            model_spaces = config.HPO_SPACES.get(model_name, {})
+            selected_space = model_spaces.get("random", {})
+            
+            if not selected_space:
+                pipeline.fit(X_train, y_train)
+                return pipeline
+
+            st.toast(f"🐝 ABC Optimizing: {model_name}...", icon="🐝")
+            
+            abc_opt = ABCHyperparameterOptimizer(
+                estimator=pipeline,
+                param_distributions=selected_space,
+                cv=cv_strategy,
+                n_population=6,  
+                max_iter=5       
+            )
+            
+            abc_opt.fit(X_train, y_train)
+            return abc_opt.best_estimator_
+
+    # =========================================================
     # OPTUNA and HYPERBAND INTEGRATION
     # =========================================================
     if method in ["Optuna", "Hyperband","Bayesian Optimization"]:
@@ -709,20 +922,15 @@ def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scale
             return pipeline
 
         def objective(trial):
-            # 1. Get parameters
             params = get_optuna_params(trial, model_name)
-            if not params: # Return default (infinity) if no parameters are defined
+            if not params: 
                 return float('inf')
 
-            # 2. Set parameters to the pipeline
-            # Note: Parameter names must already be in 'model__param' format
             try:
                 pipeline.set_params(**params)
             except Exception:
-                pass # Skip if incompatible parameter
+                pass 
             
-            # 3. Cross Validation
-            # Returns negative MSE, so multiply by - to make it positive (for minimization)
             scores = cross_val_score(
                 pipeline, X_train, y_train, 
                 cv=cv_strategy, 
@@ -732,23 +940,19 @@ def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scale
             mse_score = -scores.mean()
             return mse_score
 
-        # Pruner setup: HyperbandPruner if Hyperband is selected, otherwise MedianPruner (default) or None
         pruner = HyperbandPruner(min_resource=1, max_resource="auto", reduction_factor=3) if method == "Hyperband" else None
         
         if method == "Bayesian Optimization":
-        # Sampler setup: TPE (Tree-structured Parzen Estimator) is standard
             sampler = TPESampler(seed=config.DATA_CONFIG["random_state"])
         else:
             sampler = TPESampler(seed=config.DATA_CONFIG["random_state"])
 
         study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
         
-        # Number of trials (Could be higher in Hyperband for performance/time balance, but limited here)
         n_trials_count = 50 if method == "Hyperband" else 20
         
         study.optimize(objective, n_trials=n_trials_count, show_progress_bar=False)
         
-        # Get best parameters and retrain the model
         best_params = study.best_params
         pipeline.set_params(**best_params)
         pipeline.fit(X_train, y_train)
@@ -758,30 +962,26 @@ def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scale
     # =========================================================
     # EXISTING RANDOM / GRID SEARCH (Legacy Code Block)
     # =========================================================
-    
     # 3) HPO Spaces from CONFIG
     model_spaces = config.HPO_SPACES.get(model_name, {})
     
     if method == "Random Search":
         selected_space = model_spaces.get("random", {})
-    else: # Grid Search
+    else: 
         selected_space = model_spaces.get("grid", {})
 
     if not selected_space:
         pipeline.fit(X_train, y_train)
         return pipeline
 
-    # Check pipeline parameter names (Config compatibility)
     if model_name in config.MODEL_DEFAULT_PARAMS:
         allowed_keys = config.MODEL_DEFAULT_PARAMS[model_name].keys()
-        # Filter only those starting with model__ and present in config (for safety)
         pass 
     
     if not selected_space:
          pipeline.fit(X_train, y_train)
          return pipeline
 
-    # Search Execution
     if method == "Random Search":
         search_engine = RandomizedSearchCV(
             estimator=pipeline,
@@ -1184,16 +1384,646 @@ def create_combined_radar(pfi_df, shap_df=None, top_k=10, title="PFI + SHAP Rada
     fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0,1])), showlegend=True, title=title)
     return fig
 
+# --------------------------------------------------------------------------
+# 1. SHAP ANALİZ FONKSİYONU
+# --------------------------------------------------------------------------
+def analyze_shap(model, estimator, X_test, key_suffix, cache_for_pdf=None):
+    """
+    SHAP analizlerini gerçekleştirir ve SHAP önem tablosunu döndürür.
+    """
+    shap_imp_df = None
+    st.markdown(f'## 🌈 SHAP Global & Local Explanations ({key_suffix})')
+    
+    try:
+        # Veri setini hazırla (Pipeline ise scale et)
+        X_shap = X_test.iloc[:min(300, len(X_test))].copy()
+        is_pipeline = isinstance(model, Pipeline)
+        
+        if is_pipeline and 'scaler' in model.named_steps:
+            try:
+                X_shap = pd.DataFrame(
+                    model.named_steps['scaler'].transform(X_shap),
+                    columns=X_shap.columns, 
+                    index=X_shap.index
+                )
+            except: 
+                pass
+
+        # Explainer oluştur
+        try:
+            explainer = shap.TreeExplainer(estimator)
+            shap_values = explainer.shap_values(X_shap)
+        except:
+            explainer = shap.Explainer(estimator, X_shap)
+            shap_values = explainer(X_shap)
+
+        # shap_importance_df fonksiyonunun tanımlı olduğu varsayılmaktadır
+        shap_imp_df = shap_importance_df(shap_values, X_shap)
+
+        shap_tabs = st.tabs(['🎯 Summary Plot', '📊 Feature Importance', '🔎 Instance Waterfall', '⚡ Force Plot'])
+
+        # --- Tab 1: Summary Plot ---
+        with shap_tabs[0]:
+            fig, ax = plt.subplots(figsize=(7,5))
+            plt.title(f"{key_suffix} - SHAP Summary") 
+            shap.summary_plot(shap_values, X_shap, show=False)
+            st.pyplot(fig)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"]["SHAP Summary"] = fig
+
+        # --- Tab 2: Feature Importance ---
+        with shap_tabs[1]:
+            if shap_imp_df is not None and not shap_imp_df.empty:
+                sub1, sub2 = st.tabs(["📋 Table", "📊 Chart"])
+                with sub1:
+                    st.dataframe(shap_imp_df)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["metrics"]["SHAP Table"] = shap_imp_df
+                with sub2:
+                    fig_imp = px.bar(
+                        shap_imp_df.head(20),
+                        x='Importance',
+                        y='Feature',
+                        orientation='h',
+                        title=f'{key_suffix} - Top SHAP Feature Importance' 
+                    )
+                    fig_imp.update_layout(template='plotly_white', height=450)
+                    st.plotly_chart(fig_imp, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"]["SHAP Feature Importance"] = fig_imp
+
+        # --- Tab 3: Waterfall Plot ---
+        with shap_tabs[2]:
+            idx_w = st.number_input('Select Instance Index', 0, len(X_shap)-1, 0,
+                                    key=f'shap_w_input_{key_suffix}')
+            vals = shap_values.values if hasattr(shap_values,'values') else shap_values
+            if isinstance(vals, list):
+                vals = np.array(vals[0])
+            if vals.ndim == 3:
+                vals = vals[0]
+                
+            df_w = pd.DataFrame({'Feature': X_shap.columns.tolist(), 'SHAP': vals[idx_w]})
+            df_w = df_w.sort_values('SHAP', key=np.abs, ascending=False).head(12)
+            
+            # Base value kontrolü
+            base_val = explainer.expected_value
+            if isinstance(base_val, (list, np.ndarray)):
+                base_val = base_val[0]
+
+            df_w['Contribution'] = df_w['SHAP'].cumsum() + float(base_val)
+            
+            fig_w = px.bar(df_w, x='SHAP', y='Feature', orientation='h',
+                           title=f'{key_suffix} - SHAP Waterfall (Instance {idx_w})', color='SHAP') 
+            fig_w.update_layout(template='plotly_white', height=450)
+            st.plotly_chart(fig_w, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"][f"SHAP Waterfall {idx_w}"] = fig_w
+
+        # --- Tab 4: Force Plot ---
+        with shap_tabs[3]:
+            idx_f = st.number_input('Select Instance for Force Plot', 0, len(X_shap)-1, 0,
+                                    key=f'shap_force_idx_{key_suffix}')
+            vals = shap_values.values if hasattr(shap_values, 'values') else shap_values
+            if isinstance(vals, list):
+                vals = np.array(vals[0])
+            if vals.ndim == 3:
+                vals = vals[0]
+            instance_shap = vals[idx_f]
+            
+            base_val = explainer.expected_value
+            if isinstance(base_val, (list, np.ndarray)):
+                base_val = float(base_val[0])
+                
+            force_plot = shap.force_plot(
+                base_val,
+                instance_shap,
+                X_shap.iloc[idx_f, :],
+                matplotlib=False
+            )
+            st.write(f"**Model:** {key_suffix}") 
+            # st_shap fonksiyonunun streamlit-shap kütüphanesinden geldiği varsayılmaktadır
+            st_shap(force_plot, height=300)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"][f"SHAP Force Plot {idx_f}"] = force_plot
+
+    except Exception as e:
+        st.error(f'SHAP Error: {e}')
+        
+    return shap_imp_df
+
+# --------------------------------------------------------------------------
+# 2. PFI (Permutation Feature Importance) ANALİZ FONKSİYONU
+# --------------------------------------------------------------------------
+def analyze_pfi(estimator, X_test, y_test, key_suffix, cache_for_pdf=None):
+    """
+    PFI analizlerini gerçekleştirir ve önem tablosunu döndürür.
+    """
+    pfi_imp_df = None
+    st.markdown(f'## 🚀 PFI - {key_suffix}')
+    
+    try:
+        r = permutation_importance(
+            estimator, X_test, y_test,
+            n_repeats=15,
+            random_state=42,
+            n_jobs=-1
+        )
+        idx = r.importances_mean.argsort()[::-1]
+        pfi_imp_df = pd.DataFrame({
+            'Feature': X_test.columns[idx],
+            'Importance': r.importances_mean[idx],
+            'Std Dev': r.importances_std[idx]
+        })
+
+        tab_table, tab_bar, tab_box, tab_errorbar = st.tabs([
+            "📋 Table", "📊 Bar Chart", "📉 Boxplot", "📈 Error Bars"
+        ])
+
+        # --- Tab 1: Table ---
+        with tab_table:
+            st.dataframe(pfi_imp_df)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["metrics"]["PFI Table"] = pfi_imp_df
+
+        # --- Tab 2: Bar Chart ---
+        with tab_bar:
+            fig_pfi = px.bar(
+                pfi_imp_df.head(20),
+                x='Importance',
+                y='Feature',
+                orientation='h',
+                error_x='Std Dev',
+                title=f'{key_suffix} - Top 20 PFI Features' 
+            )
+            fig_pfi.update_layout(template='plotly_white', height=450)
+            st.plotly_chart(fig_pfi, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"]["PFI Bar"] = fig_pfi
+
+        # --- Tab 3: Boxplot ---
+        with tab_box:
+            fig_box = px.box(
+                r.importances.T[:, idx][:, :20],
+                labels={'variable': 'Feature', 'value': 'Importance'},
+                title=f'{key_suffix} - PFI Distribution' 
+            )
+            fig_box.update_layout(
+                template='plotly_white',
+                height=500,
+                xaxis=dict(
+                    tickvals=list(range(20)),
+                    ticktext=list(pfi_imp_df['Feature'].head(20))
+                )
+            )
+            st.plotly_chart(fig_box, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"]["PFI Boxplot"] = fig_box
+
+        # --- Tab 4: Error Bars ---
+        with tab_errorbar:
+            fig_err = px.scatter(
+                pfi_imp_df.head(20),
+                x='Importance',
+                y='Feature',
+                error_x='Std Dev',
+                title=f'{key_suffix} - PFI Importance ± Std Dev' 
+            )
+            fig_err.update_traces(mode='markers')
+            fig_err.update_layout(template='plotly_white', height=500)
+            st.plotly_chart(fig_err, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"]["PFI Error Bars"] = fig_err
+
+    except Exception as e:
+        st.error(f'PFI Error: {e}')
+        
+    return pfi_imp_df
+
+# --------------------------------------------------------------------------
+# 3. LIME ANALİZ FONKSİYONU
+# --------------------------------------------------------------------------
+def analyze_lime(model, X_train, X_test, key_suffix, lime_num_features, cache_for_pdf=None):
+    """
+    LIME analizlerini gerçekleştirir.
+    """
+    st.markdown(f'## 💡 LIME - {key_suffix}')
+    
+    try:
+        # Import lime_tabular here or at top
+        from lime import lime_tabular 
+        
+        explainer_lime = lime_tabular.LimeTabularExplainer(
+            X_train.values,
+            feature_names=X_train.columns.tolist(),
+            mode='regression',
+            discretize_continuous=True,
+            verbose=False
+        )
+
+        # --- Single Instance Selection ---
+        idx = st.number_input(
+            'Select Test Instance',
+            0, len(X_test)-1, 0,
+            key=f'lime_idx_{key_suffix}'
+        )
+        exp = explainer_lime.explain_instance(
+            X_test.iloc[idx].values,
+            lambda x: model.predict(x),
+            num_features=lime_num_features
+        )
+        lime_df = pd.DataFrame(exp.as_list(), columns=['feature', 'LIME Score'])
+        lime_df['Percentage Importance LIME'] = (
+            lime_df['LIME Score'].abs() / lime_df['LIME Score'].abs().sum()
+        ) * 100
+
+        lime_tabs = st.tabs([
+            "🔍 Instance Explanation", 
+            "📄 Contribution Table", 
+            "📊 Bar Chart", 
+            "🐝 Multi-Instance Summary"
+        ])
+
+        # --- Tab 1: Instance Explanation ---
+        with lime_tabs[0]:
+            st.caption(f"LIME Explanation for Model: {key_suffix}")
+            # components'in streamlit.components.v1 olduğu varsayılır
+            if 'components' in globals() and components is not None:
+                components.html(exp.as_html(), height=450, scrolling=True)
+            else:
+                # Fallback if components is not imported
+                st.components.v1.html(exp.as_html(), height=450, scrolling=True)
+
+        # --- Tab 2: Contribution Table ---
+        with lime_tabs[1]:
+            fig_table = go.Figure(data=[go.Table(
+                header=dict(
+                    values=["Feature", "LIME Score", "% Importance"],
+                    fill_color='darkslategray',
+                    font=dict(color='white', size=14),
+                    align='left'
+                ),
+                cells=dict(
+                    values=[
+                        lime_df['feature'],
+                        np.round(lime_df['LIME Score'], 4),
+                        np.round(lime_df['Percentage Importance LIME'], 2)
+                    ],
+                    fill_color='lavender',
+                    align='left',
+                    font=dict(color='black', size=12)
+                )
+            )])
+            st.plotly_chart(fig_table, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["metrics"]["LIME Table"] = lime_df
+
+        # --- Tab 3: Enhanced Bar Chart ---
+        with lime_tabs[2]:
+            fig_bar = px.bar(
+                lime_df.sort_values("LIME Score", ascending=True),
+                x="LIME Score",
+                y="feature",
+                orientation="h",
+                color="LIME Score",
+                color_continuous_scale=px.colors.diverging.RdBu,
+                color_continuous_midpoint=0,
+                title=f"{key_suffix} - LIME Feature Contributions",
+                labels={"feature": "Feature", "LIME Score": "Score"},
+                height=500
+            )
+            fig_bar.update_layout(
+                title_font=dict(size=18, family="Arial, bold"),
+                yaxis=dict(tickfont=dict(size=12)),
+                xaxis=dict(tickfont=dict(size=12))
+            )
+            fig_bar.update_traces(
+                hovertemplate="<b>%{y}</b><br>LIME Score: %{x:.4f}<br>% Importance: %{customdata[0]:.2f}%",
+                customdata=np.stack((lime_df['Percentage Importance LIME'],), axis=-1)
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"]["LIME Bar"] = fig_bar
+
+        # --- Tab 4: Multi-instance Summary ---
+        with lime_tabs[3]:
+            st.caption(f"Multi-instance LIME Summary for {key_suffix}")
+            num_instances = min(50, len(X_test)) 
+            lime_summary = []
+
+            for i in range(num_instances):
+                exp_i = explainer_lime.explain_instance(
+                    X_test.iloc[i].values,
+                    lambda x: model.predict(x),
+                    num_features=len(X_train.columns)
+                )
+                temp_df = pd.DataFrame(exp_i.as_list(), columns=['feature', 'LIME Score'])
+                temp_df['Instance'] = i
+                lime_summary.append(temp_df)
+
+            lime_summary_df = pd.concat(lime_summary, ignore_index=True)
+
+            summary_plot_type = st.radio(
+                "Select Multi-instance Summary Plot Type",
+                options=["Heatmap", "Beeswarm"],
+                index=0,
+                key=f"multi_lime_plot_{key_suffix}"
+            )
+
+            if summary_plot_type == "Heatmap":
+                heatmap_data = lime_summary_df.pivot(index='feature', columns='Instance', values='LIME Score')
+                fig_heatmap = px.imshow(
+                    heatmap_data,
+                    color_continuous_scale='RdBu',
+                    aspect='auto',
+                    origin='lower',
+                    labels=dict(x="Instance", y="Feature", color="LIME Score"),
+                    title=f"{key_suffix} - Multi-instance LIME Heatmap"
+                )
+                fig_heatmap.update_layout(height=600, width=900)
+                st.plotly_chart(fig_heatmap, use_container_width=True)
+
+            elif summary_plot_type == "Beeswarm":
+                fig_beeswarm = px.strip(
+                    lime_summary_df,
+                    x="LIME Score",
+                    y="feature",
+                    color="LIME Score",
+                    color_continuous_scale='RdBu',
+                    hover_data=["Instance"],
+                    title=f"{key_suffix} - Multi-instance LIME Beeswarm",
+                    orientation='h'
+                )
+                fig_beeswarm.update_layout(
+                    height=600,
+                    width=900,
+                    yaxis=dict(categoryorder='total ascending')
+                )
+                st.plotly_chart(fig_beeswarm, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"LIME Error: {e}")
+
+# --------------------------------------------------------------------------
+# 4. COUNTERFACTUAL (DICE) ANALİZ FONKSİYONU
+# --------------------------------------------------------------------------
+def analyze_counterfactual(estimator, X_train, X_test, key_suffix, cache_for_pdf=None):
+    """
+    Counterfactual (Dice) analizlerini gerçekleştirir.
+    """
+    st.markdown(f"## 🔄 Counterfactual - {key_suffix}")
+    
+    try:
+        import dice_ml  # Fonksiyon içinde import
+        
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "📄 Tabular View",
+            "📊 Difference Heatmap",
+            "🧭 Radar Plot",
+            "🔧 Minimal Feature Change",
+            "📈 CF Prediction Plot"
+        ])
+
+        idx = st.number_input("Select Test Instance", 0, len(X_test)-1, 0,
+                              key=f"cf_idx_{key_suffix}")
+        x0 = X_test.iloc[[idx]].copy()
+        y0 = estimator.predict(x0)[0]
+        delta = abs(y0)*0.2 if y0 != 0 else 1
+
+        df_dice = X_train.copy()
+        outcome_col = "target"  
+        df_dice[outcome_col] = estimator.predict(X_train)
+
+        data_dice = dice_ml.Data(
+            dataframe=df_dice,
+            continuous_features=X_train.columns.tolist(),
+            outcome_name=outcome_col
+        )
+        model_dice = dice_ml.Model(model=estimator, backend="sklearn", model_type="regressor")
+        exp_cf = dice_ml.Dice(data_dice, model_dice, method="random")
+
+        desired_range = [y0 - delta, y0 + delta]
+
+        cf = exp_cf.generate_counterfactuals(
+            x0,
+            total_CFs=3,
+            desired_range=desired_range
+        )
+        cf_df = cf.cf_examples_list[0].final_cfs_df.copy()
+
+        if "type" not in cf_df.columns:
+            cf_df["type"] = "CF"
+        original_df = x0.copy()
+        original_df["type"] = "Original"
+        
+        # --- Tab 1: Tabular View ---
+        with tab1:
+            st.dataframe(cf_df)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["metrics"]["Counterfactual Table"] = cf_df
+
+        cols_to_drop = ['type', outcome_col]
+        cf_features = cf_df.drop(columns=cols_to_drop, errors='ignore')
+
+        # --- Tab 2: Difference Heatmap ---
+        with tab2:
+            diff = cf_features.subtract(x0.values[0])
+            fig_diff = px.imshow(diff.T, text_auto=True, aspect="auto",
+                                 labels=dict(x="CF Instance", y="Feature", color="Difference"),
+                                 title=f"{key_suffix} - Feature Difference Heatmap") 
+            st.plotly_chart(fig_diff, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"]["CF Heatmap"] = fig_diff
+
+        # --- Tab 3: Radar Plot ---
+        with tab3:
+            fig_radar_cf = px.line_polar(
+                cf_features.T,
+                r=cf_features.T.values.flatten(),
+                theta=cf_features.T.index.repeat(cf_features.shape[0]),
+                line_close=True, title=f"{key_suffix} - CF Radar Plot"
+            ) 
+            st.plotly_chart(fig_radar_cf, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"]["CF Radar"] = fig_radar_cf
+
+        # --- Tab 4: Minimal Feature Change ---
+        with tab4:
+            min_change = (cf_features - x0.values).abs().min(axis=1)
+            fig_min = px.bar(
+                x=[f"CF{i}" for i in range(len(min_change))],
+                y=min_change,
+                title=f"{key_suffix} - Minimal Feature Change per CF"
+            ) 
+            st.plotly_chart(fig_min, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"]["CF Min Change"] = fig_min
+
+        # --- Tab 5: CF Prediction Plot ---
+        with tab5:
+            pred_vals = estimator.predict(cf_features)
+            fig_pred = px.bar(
+                x=[f"CF{i}" for i in range(len(pred_vals))],
+                y=pred_vals,
+                title=f"{key_suffix} - Counterfactual Predictions"
+            ) 
+            st.plotly_chart(fig_pred, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"]["CF Predictions"] = fig_pred
+
+    except Exception as e:
+        st.error(f"Counterfactual Error: {e}")
+
+# --------------------------------------------------------------------------
+# 5. ANCHOR ANALİZ FONKSİYONU
+# --------------------------------------------------------------------------
+def analyze_anchor(estimator, X_train, X_test, key_suffix, cache_for_pdf=None):
+    """
+    Anchor analizlerini gerçekleştirir.
+    """
+    st.markdown(f"## 🪝 Anchor - {key_suffix}")
+    
+    try:
+        from alibi.explainers import AnchorTabular
+        
+        feature_names = X_train.columns.tolist()
+        X_train_np = X_train.values
+        X_test_np = X_test.values
+        predict_fn = lambda x: estimator.predict(x)
+
+        explainer_anchor = AnchorTabular(predict_fn, feature_names=feature_names)
+        explainer_anchor.fit(X_train_np)
+
+        idx = st.number_input(
+            "Select Test Instance for Anchor",
+            0, len(X_test_np)-1, 0,
+            key=f"anchor_idx_{key_suffix}"
+        )
+        exp_anchor = explainer_anchor.explain(X_test_np[int(idx)])
+        anchor_rules = list(exp_anchor.anchor)
+
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "📌 Anchor Rules", "🌊 Precision & Coverage", "📈 3D Heatmap",
+            "🌳 Decision Tree", "📡 Neighborhood Stats"
+        ])
+
+        # --- Tab 1: Rules ---
+        with tab1:
+            st.write(anchor_rules)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["metrics"]["Anchor Rules"] = anchor_rules
+
+        # --- Tab 2: Stats ---
+        with tab2:
+            st.metric("Precision", exp_anchor.precision)
+            st.metric("Coverage", exp_anchor.coverage)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["metrics"]["Anchor Precision"] = exp_anchor.precision
+                cache_for_pdf[key_suffix]["metrics"]["Anchor Coverage"] = exp_anchor.coverage
+
+        # --- Tab 3: 3D Heatmap ---
+        with tab3:
+            y_pred = estimator.predict(X_test_np)
+            fig_heat = px.scatter_3d(
+                x=X_test_np[:,0], y=X_test_np[:,1], z=y_pred,
+                color=y_pred, title=f"{key_suffix} - Local Predictions 3D Heatmap" 
+            )
+            st.plotly_chart(fig_heat, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"]["Anchor Heatmap"] = fig_heat
+
+        # --- Tab 4: Decision Tree ---
+        with tab4:
+            if hasattr(estimator, 'estimators_'):
+                tree = estimator.estimators_[0].tree_
+                fig_tree = px.treemap(
+                    pd.DataFrame({
+                        "Feature": [feature_names[i] if i >= 0 else "Leaf" for i in tree.feature],
+                        "Samples": tree.n_node_samples
+                    }),
+                    path=["Feature"], values="Samples",
+                    title=f"{key_suffix} - Decision Tree Treemap" 
+                )
+            elif hasattr(estimator, 'tree_'):
+                tree = estimator.tree_
+                fig_tree = px.treemap(
+                    pd.DataFrame({
+                        "Feature": [feature_names[i] if i >= 0 else "Leaf" for i in tree.feature],
+                        "Samples": tree.n_node_samples
+                    }),
+                    path=["Feature"], values="Samples",
+                    title=f"{key_suffix} - Decision Tree Treemap" 
+                )
+            else:
+                st.info("Decision tree visualization not available for this model.")
+                fig_tree = None
+
+            if fig_tree is not None:
+                st.plotly_chart(fig_tree, use_container_width=True)
+                if cache_for_pdf is not None:
+                    cache_for_pdf[key_suffix]["figs"]["Anchor Tree"] = fig_tree
+
+        # --- Tab 5: Neighborhood Stats ---
+        with tab5:
+            mask = np.ones(len(X_train), dtype=bool)
+            for rule in anchor_rules:
+                parts = rule.split(" ")
+                if len(parts) == 3 and parts[1] in ['<=','>']:
+                    f, op, val = parts
+                    val = float(val)
+                    if op == "<=":
+                        mask &= X_train[f] <= val
+                    else:
+                        mask &= X_train[f] > val
+            neigh_df = X_train[mask]
+            st.dataframe(neigh_df.head(20))
+
+            fig_neigh = px.histogram(
+                neigh_df, x=feature_names[0], nbins=20,
+                title=f"{key_suffix} - Neighborhood of '{feature_names[0]}'"
+            ) 
+            st.plotly_chart(fig_neigh, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"]["Anchor Neighborhood"] = fig_neigh
+
+    except Exception as e:
+        st.error(f"Anchor Error: {e}")
+
+# --------------------------------------------------------------------------
+# 6. RADAR CHART ANALİZ FONKSİYONU
+# --------------------------------------------------------------------------
+def analyze_radar(pfi_imp_df, shap_imp_df, key_suffix, radar_top_k, cache_for_pdf=None):
+    """
+    PFI ve SHAP sonuçlarını birleştiren Radar grafiğini çizer.
+    """
+    try:
+        with st.expander('📡 Combined Radar'):
+            # create_combined_radar fonksiyonunun tanımlı olduğu varsayılmaktadır
+            fig_radar = create_combined_radar(
+                pfi_imp_df if pfi_imp_df is not None else pd.DataFrame({'Feature':[], 'Importance':[]}), 
+                shap_imp_df, 
+                top_k=radar_top_k,
+                title=f"{key_suffix} - PFI + SHAP Radar" 
+            )
+            st.plotly_chart(fig_radar, use_container_width=True)
+            if cache_for_pdf is not None:
+                cache_for_pdf[key_suffix]["figs"]["Combined Radar"] = fig_radar
+    except Exception as e:
+        st.error(f'Radar Error: {e}')
+
+# --------------------------------------------------------------------------
+# 7. ANA ORKESTRASYON FONKSİYONU
+# --------------------------------------------------------------------------
 def run_xai_analysis(model, X_train, X_test, y_test, methods, key_suffix,
-                     cache_for_pdf=None,
-                     lime_sample=config.XAI_CONFIG["lime_sample_size"], 
-                     lime_num_features=config.XAI_CONFIG["lime_num_features"], 
-                     radar_top_k=config.XAI_CONFIG["radar_top_k"]):
+                      cache_for_pdf=None,
+                      lime_sample=config.XAI_CONFIG["lime_sample_size"], 
+                      lime_num_features=config.XAI_CONFIG["lime_num_features"], 
+                      radar_top_k=config.XAI_CONFIG["radar_top_k"]):
     
     if not methods:
         st.info("No XAI methods selected.")
         return
 
+    # PDF Cache başlatma
     if cache_for_pdf is not None:
         if key_suffix not in cache_for_pdf:
             cache_for_pdf[key_suffix] = {"figs": {}, "metrics": {}}
@@ -1205,544 +2035,34 @@ def run_xai_analysis(model, X_train, X_test, y_test, methods, key_suffix,
     shap_imp_df = None
     pfi_imp_df = None
 
-    # -------------------- SHAP --------------------
+    # SHAP
     if 'SHAP' in methods and shap is not None:
         with xai_tabs[methods.index('SHAP')]:
-            st.markdown(f'## 🌈 SHAP Global & Local Explanations ({key_suffix})')
-            try:
-                X_shap = X_test.iloc[:min(300,len(X_test))].copy()
-                if is_pipeline and 'scaler' in model.named_steps:
-                    try:
-                        X_shap = pd.DataFrame(model.named_steps['scaler'].transform(X_shap),
-                                              columns=X_shap.columns, index=X_shap.index)
-                    except: pass
+            shap_imp_df = analyze_shap(model, estimator, X_test, key_suffix, cache_for_pdf)
 
-                try:
-                    explainer = shap.TreeExplainer(estimator)
-                    shap_values = explainer.shap_values(X_shap)
-                except:
-                    explainer = shap.Explainer(estimator, X_shap)
-                    shap_values = explainer(X_shap)
-
-                shap_imp_df = shap_importance_df(shap_values, X_shap)
-
-                shap_tabs = st.tabs(['🎯 Summary Plot', '📊 Feature Importance', '🔎 Instance Waterfall', '⚡ Force Plot'])
-
-                # Summary Plot
-                with shap_tabs[0]:
-                    fig, ax = plt.subplots(figsize=(7,5))
-                    plt.title(f"{key_suffix} - SHAP Summary") 
-                    shap.summary_plot(shap_values, X_shap, show=False)
-                    st.pyplot(fig)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"]["SHAP Summary"] = fig
-
-                # Feature Importance
-                with shap_tabs[1]:
-                    if shap_imp_df is not None and not shap_imp_df.empty:
-                        sub1, sub2 = st.tabs(["📋 Table", "📊 Chart"])
-                        with sub1:
-                            st.dataframe(shap_imp_df)
-                            if cache_for_pdf is not None:
-                                cache_for_pdf[key_suffix]["metrics"]["SHAP Table"] = shap_imp_df
-                        with sub2:
-                            fig_imp = px.bar(
-                                shap_imp_df.head(20),
-                                x='Importance',
-                                y='Feature',
-                                orientation='h',
-                                title=f'{key_suffix} - Top SHAP Feature Importance' 
-                            )
-                            fig_imp.update_layout(template='plotly_white', height=450)
-                            st.plotly_chart(fig_imp, use_container_width=True)
-                            if cache_for_pdf is not None:
-                                cache_for_pdf[key_suffix]["figs"]["SHAP Feature Importance"] = fig_imp
-
-                # Waterfall Plot
-                with shap_tabs[2]:
-                    idx_w = st.number_input('Select Instance Index', 0, len(X_shap)-1, 0,
-                                            key=f'shap_w_input_{key_suffix}')
-                    vals = shap_values.values if hasattr(shap_values,'values') else shap_values
-                    if isinstance(vals, list):
-                        vals = np.array(vals[0])
-                    if vals.ndim == 3:
-                        vals = vals[0]
-                    df_w = pd.DataFrame({'Feature': X_shap.columns.tolist(), 'SHAP': vals[idx_w]})
-                    df_w = df_w.sort_values('SHAP', key=np.abs, ascending=False).head(12)
-                    df_w['Contribution'] = df_w['SHAP'].cumsum() + float(
-                        explainer.expected_value if not isinstance(explainer.expected_value,(list,np.ndarray))
-                        else explainer.expected_value[0]
-                    )
-                    fig_w = px.bar(df_w, x='SHAP', y='Feature', orientation='h',
-                                   title=f'{key_suffix} - SHAP Waterfall (Instance {idx_w})', color='SHAP') 
-                    fig_w.update_layout(template='plotly_white', height=450)
-                    st.plotly_chart(fig_w, use_container_width=True)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"][f"SHAP Waterfall {idx_w}"] = fig_w
-
-                # Force Plot
-                with shap_tabs[3]:
-                    idx_f = st.number_input('Select Instance for Force Plot', 0, len(X_shap)-1, 0,
-                                            key=f'shap_force_idx_{key_suffix}')
-                    vals = shap_values.values if hasattr(shap_values, 'values') else shap_values
-                    if isinstance(vals, list):
-                        vals = np.array(vals[0])
-                    if vals.ndim == 3:
-                        vals = vals[0]
-                    instance_shap = vals[idx_f]
-                    base_val = explainer.expected_value
-                    if isinstance(base_val, (list, np.ndarray)):
-                        base_val = float(base_val[0])
-                    force_plot = shap.force_plot(
-                        base_val,
-                        instance_shap,
-                        X_shap.iloc[idx_f, :],
-                        matplotlib=False
-                    )
-                    st.write(f"**Model:** {key_suffix}") 
-                    st_shap(force_plot, height=300)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"][f"SHAP Force Plot {idx_f}"] = force_plot
-
-            except Exception as e: st.error(f'SHAP Error: {e}')
-
-    # -------------------- PFI --------------------
+    # PFI
     if 'PFI' in methods:
         with xai_tabs[methods.index('PFI')]:
-            st.markdown(f'## 🚀 PFI - {key_suffix}')
-            try:
-                r = permutation_importance(
-                    estimator, X_test, y_test,
-                    n_repeats=15,
-                    random_state=42,
-                    n_jobs=-1
-                )
-                idx = r.importances_mean.argsort()[::-1]
-                pfi_imp_df = pd.DataFrame({
-                    'Feature': X_test.columns[idx],
-                    'Importance': r.importances_mean[idx],
-                    'Std Dev': r.importances_std[idx]
-                })
+            pfi_imp_df = analyze_pfi(estimator, X_test, y_test, key_suffix, cache_for_pdf)
 
-                tab_table, tab_bar, tab_box, tab_errorbar = st.tabs([
-                    "📋 Table", "📊 Bar Chart", "📉 Boxplot", "📈 Error Bars"
-                ])
-
-                with tab_table:
-                    st.dataframe(pfi_imp_df)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["metrics"]["PFI Table"] = pfi_imp_df
-
-                with tab_bar:
-                    fig_pfi = px.bar(
-                        pfi_imp_df.head(20),
-                        x='Importance',
-                        y='Feature',
-                        orientation='h',
-                        error_x='Std Dev',
-                        title=f'{key_suffix} - Top 20 PFI Features' 
-                    )
-                    fig_pfi.update_layout(template='plotly_white', height=450)
-                    st.plotly_chart(fig_pfi, use_container_width=True)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"]["PFI Bar"] = fig_pfi
-
-                with tab_box:
-                    fig_box = px.box(
-                        r.importances.T[:, idx][:, :20],
-                        labels={'variable': 'Feature', 'value': 'Importance'},
-                        title=f'{key_suffix} - PFI Distribution' 
-                    )
-                    fig_box.update_layout(
-                        template='plotly_white',
-                        height=500,
-                        xaxis=dict(
-                            tickvals=list(range(20)),
-                            ticktext=list(pfi_imp_df['Feature'].head(20))
-                        )
-                    )
-                    st.plotly_chart(fig_box, use_container_width=True)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"]["PFI Boxplot"] = fig_box
-
-                with tab_errorbar:
-                    fig_err = px.scatter(
-                        pfi_imp_df.head(20),
-                        x='Importance',
-                        y='Feature',
-                        error_x='Std Dev',
-                        title=f'{key_suffix} - PFI Importance ± Std Dev' 
-                    )
-                    fig_err.update_traces(mode='markers')
-                    fig_err.update_layout(template='plotly_white', height=500)
-                    st.plotly_chart(fig_err, use_container_width=True)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"]["PFI Error Bars"] = fig_err
-
-            except Exception as e:
-                st.error(f'PFI Error: {e}')
-
-    # -------------------- LIME --------------------
+    # LIME
     if 'LIME' in methods:
         with xai_tabs[methods.index('LIME')]:
-            st.markdown(f'## 💡 LIME - {key_suffix}')
-            try:
-                explainer_lime = lime_tabular.LimeTabularExplainer(
-                    X_train.values,
-                    feature_names=X_train.columns.tolist(),
-                    mode='regression',
-                    discretize_continuous=True,
-                    verbose=False
-                )
+            analyze_lime(model, X_train, X_test, key_suffix, lime_num_features, cache_for_pdf)
 
-                # ---------- Single Instance ----------
-                idx = st.number_input(
-                    'Select Test Instance',
-                    0, len(X_test)-1, 0,
-                    key=f'lime_idx_{key_suffix}'
-                )
-                exp = explainer_lime.explain_instance(
-                    X_test.iloc[idx].values,
-                    lambda x: model.predict(x),
-                    num_features=lime_num_features
-                )
-                lime_df = pd.DataFrame(exp.as_list(), columns=['feature', 'LIME Score'])
-                lime_df['Percentage Importance LIME'] = (
-                    lime_df['LIME Score'].abs() / lime_df['LIME Score'].abs().sum()
-                ) * 100
-
-                lime_tabs = st.tabs([
-                    "🔍 Instance Explanation", 
-                    "📄 Contribution Table", 
-                    "📊 Bar Chart", 
-                    "🐝 Multi-Instance Summary"
-                ])
-
-                # ---------- Instance Explanation ----------
-                with lime_tabs[0]:
-                    st.caption(f"LIME Explanation for Model: {key_suffix}")
-                    if components is not None:
-                        components.html(exp.as_html(), height=450, scrolling=True)
-                    else:
-                        st.write(exp.as_list())
-
-                # ---------- Professional Contribution Table ----------
-                with lime_tabs[1]:
-                    fig_table = go.Figure(data=[go.Table(
-                        header=dict(
-                            values=["Feature", "LIME Score", "% Importance"],
-                            fill_color='darkslategray',
-                            font=dict(color='white', size=14),
-                            align='left'
-                        ),
-                        cells=dict(
-                            values=[
-                                lime_df['feature'],
-                                np.round(lime_df['LIME Score'], 4),
-                                np.round(lime_df['Percentage Importance LIME'], 2)
-                            ],
-                            fill_color='lavender',
-                            align='left',
-                            font=dict(color='black', size=12)
-                        )
-                    )])
-                    st.plotly_chart(fig_table, use_container_width=True)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["metrics"]["LIME Table"] = lime_df
-
-                # ---------- Enhanced Bar Chart ----------
-                with lime_tabs[2]:
-                    fig_bar = px.bar(
-                        lime_df.sort_values("LIME Score", ascending=True),
-                        x="LIME Score",
-                        y="feature",
-                        orientation="h",
-                        color="LIME Score",
-                        color_continuous_scale=px.colors.diverging.RdBu,
-                        color_continuous_midpoint=0,
-                        title=f"{key_suffix} - LIME Feature Contributions",
-                        labels={"feature": "Feature", "LIME Score": "Score"},
-                        height=500
-                    )
-                    fig_bar.update_layout(
-                        title_font=dict(size=18, family="Arial, bold"),
-                        yaxis=dict(tickfont=dict(size=12)),
-                        xaxis=dict(tickfont=dict(size=12))
-                    )
-                    fig_bar.update_traces(
-                        hovertemplate="<b>%{y}</b><br>LIME Score: %{x:.4f}<br>% Importance: %{customdata[0]:.2f}%",
-                        customdata=np.stack((lime_df['Percentage Importance LIME'],), axis=-1)
-                    )
-                    st.plotly_chart(fig_bar, use_container_width=True)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"]["LIME Bar"] = fig_bar
-
-                # ---------- Multi-instance Summary (Heatmap or Beeswarm) ----------
-                with lime_tabs[3]:
-                    st.caption(f"Multi-instance LIME Summary for {key_suffix}")
-                    num_instances = min(50, len(X_test))  # Çok büyükse sınırla
-                    lime_summary = []
-
-                    for i in range(num_instances):
-                        exp_i = explainer_lime.explain_instance(
-                            X_test.iloc[i].values,
-                            lambda x: model.predict(x),
-                            num_features=len(X_train.columns)
-                        )
-                        temp_df = pd.DataFrame(exp_i.as_list(), columns=['feature', 'LIME Score'])
-                        temp_df['Instance'] = i
-                        lime_summary.append(temp_df)
-
-                    lime_summary_df = pd.concat(lime_summary, ignore_index=True)
-
-                    summary_plot_type = st.radio(
-                        "Select Multi-instance Summary Plot Type",
-                        options=["Heatmap", "Beeswarm"],
-                        index=0,
-                        key=f"multi_lime_plot_{key_suffix}"
-                    )
-
-                    if summary_plot_type == "Heatmap":
-                        heatmap_data = lime_summary_df.pivot(index='feature', columns='Instance', values='LIME Score')
-                        fig_heatmap = px.imshow(
-                            heatmap_data,
-                            color_continuous_scale='RdBu',
-                            aspect='auto',
-                            origin='lower',
-                            labels=dict(x="Instance", y="Feature", color="LIME Score"),
-                            title=f"{key_suffix} - Multi-instance LIME Heatmap"
-                        )
-                        fig_heatmap.update_layout(height=600, width=900)
-                        st.plotly_chart(fig_heatmap, use_container_width=True)
-
-                    elif summary_plot_type == "Beeswarm":
-                        fig_beeswarm = px.strip(
-                            lime_summary_df,
-                            x="LIME Score",
-                            y="feature",
-                            color="LIME Score",
-                            color_continuous_scale='RdBu',
-                            hover_data=["Instance"],
-                            title=f"{key_suffix} - Multi-instance LIME Beeswarm",
-                            orientation='h'
-                        )
-                        fig_beeswarm.update_layout(
-                            height=600,
-                            width=900,
-                            yaxis=dict(categoryorder='total ascending')
-                        )
-                        st.plotly_chart(fig_beeswarm, use_container_width=True)
-
-            except Exception as e:
-                st.error(f"LIME Error: {e}")
-
-    # -------------------- Counterfactual --------------------
+    # Counterfactual
     if 'Counterfactual' in methods:
         with xai_tabs[methods.index('Counterfactual')]:
-            st.markdown(f"## 🔄 Counterfactual - {key_suffix}")
-            try:
-                tab1, tab2, tab3, tab4, tab5 = st.tabs([
-                    "📄 Tabular View",
-                    "📊 Difference Heatmap",
-                    "🧭 Radar Plot",
-                    "🔧 Minimal Feature Change",
-                    "📈 CF Prediction Plot"
-                ])
+            analyze_counterfactual(estimator, X_train, X_test, key_suffix, cache_for_pdf)
 
-                idx = st.number_input("Select Test Instance", 0, len(X_test)-1, 0,
-                                    key=f"cf_idx_{key_suffix}")
-                x0 = X_test.iloc[[idx]].copy()
-                y0 = estimator.predict(x0)[0]
-                delta = abs(y0)*0.2 if y0 != 0 else 1
-
-                df_dice = X_train.copy()
-                outcome_col = "target"  
-                df_dice[outcome_col] = estimator.predict(X_train)
-
-                data_dice = dice_ml.Data(
-                    dataframe=df_dice,
-                    continuous_features=X_train.columns.tolist(),
-                    outcome_name=outcome_col
-                )
-                model_dice = dice_ml.Model(model=estimator, backend="sklearn", model_type="regressor")
-                exp_cf = dice_ml.Dice(data_dice, model_dice, method="random")
-
-                desired_range = [y0 - delta, y0 + delta]
-
-                cf = exp_cf.generate_counterfactuals(
-                    x0,
-                    total_CFs=3,
-                    desired_range=desired_range
-                )
-                cf_df = cf.cf_examples_list[0].final_cfs_df.copy()
-
-                if "type" not in cf_df.columns:
-                    cf_df["type"] = "CF"
-                original_df = x0.copy()
-                original_df["type"] = "Original"
-                
-                with tab1:
-                    st.dataframe(cf_df)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["metrics"]["Counterfactual Table"] = cf_df
-
-                cols_to_drop = ['type', outcome_col]
-                cf_features = cf_df.drop(columns=cols_to_drop, errors='ignore')
-
-                with tab2:
-                    diff = cf_features.subtract(x0.values[0])
-                    fig_diff = px.imshow(diff.T, text_auto=True, aspect="auto",
-                                        labels=dict(x="CF Instance", y="Feature", color="Difference"),
-                                        title=f"{key_suffix} - Feature Difference Heatmap") 
-                    st.plotly_chart(fig_diff, use_container_width=True)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"]["CF Heatmap"] = fig_diff
-
-                with tab3:
-                    fig_radar_cf = px.line_polar(cf_features.T,
-                                                r=cf_features.T.values.flatten(),
-                                                theta=cf_features.T.index.repeat(cf_features.shape[0]),
-                                                line_close=True, title=f"{key_suffix} - CF Radar Plot") 
-                    st.plotly_chart(fig_radar_cf, use_container_width=True)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"]["CF Radar"] = fig_radar_cf
-
-                with tab4:
-                    min_change = (cf_features - x0.values).abs().min(axis=1)
-                    fig_min = px.bar(x=[f"CF{i}" for i in range(len(min_change))], y=min_change,
-                                    title=f"{key_suffix} - Minimal Feature Change per CF") 
-                    st.plotly_chart(fig_min, use_container_width=True)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"]["CF Min Change"] = fig_min
-
-                with tab5:
-                    pred_vals = estimator.predict(cf_features)
-                    fig_pred = px.bar(x=[f"CF{i}" for i in range(len(pred_vals))], y=pred_vals,
-                                    title=f"{key_suffix} - Counterfactual Predictions") 
-                    st.plotly_chart(fig_pred, use_container_width=True)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"]["CF Predictions"] = fig_pred
-
-            except Exception as e:
-                st.error(f"Counterfactual Error: {e}")
-
-    # -------------------- Anchor --------------------
+    # Anchor
     if 'Anchor' in methods:
         with xai_tabs[methods.index('Anchor')]:
-            st.markdown(f"## 🪝 Anchor - {key_suffix}")
-            try:
-                from alibi.explainers import AnchorTabular
-                feature_names = X_train.columns.tolist()
-                X_train_np = X_train.values
-                X_test_np = X_test.values
-                predict_fn = lambda x: estimator.predict(x)
+            analyze_anchor(estimator, X_train, X_test, key_suffix, cache_for_pdf)
 
-                explainer_anchor = AnchorTabular(predict_fn, feature_names=feature_names)
-                explainer_anchor.fit(X_train_np)
-
-                idx = st.number_input(
-                    "Select Test Instance for Anchor",
-                    0, len(X_test_np)-1, 0,
-                    key=f"anchor_idx_{key_suffix}"
-                )
-                exp_anchor = explainer_anchor.explain(X_test_np[int(idx)])
-                anchor_rules = list(exp_anchor.anchor)
-
-                tab1, tab2, tab3, tab4, tab5 = st.tabs([
-                    "📌 Anchor Rules", "🌊 Precision & Coverage", "📈 3D Heatmap",
-                    "🌳 Decision Tree", "📡 Neighborhood Stats"
-                ])
-
-                with tab1:
-                    st.write(anchor_rules)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["metrics"]["Anchor Rules"] = anchor_rules
-
-                with tab2:
-                    st.metric("Precision", exp_anchor.precision)
-                    st.metric("Coverage", exp_anchor.coverage)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["metrics"]["Anchor Precision"] = exp_anchor.precision
-                        cache_for_pdf[key_suffix]["metrics"]["Anchor Coverage"] = exp_anchor.coverage
-
-                with tab3:
-                    y_pred = estimator.predict(X_test_np)
-                    fig_heat = px.scatter_3d(
-                        x=X_test_np[:,0], y=X_test_np[:,1], z=y_pred,
-                        color=y_pred, title=f"{key_suffix} - Local Predictions 3D Heatmap" 
-                    )
-                    st.plotly_chart(fig_heat, use_container_width=True)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"]["Anchor Heatmap"] = fig_heat
-
-                with tab4:
-                    if hasattr(estimator, 'estimators_'):
-                        tree = estimator.estimators_[0].tree_
-                        fig_tree = px.treemap(
-                            pd.DataFrame({
-                                "Feature": [feature_names[i] if i >= 0 else "Leaf" for i in tree.feature],
-                                "Samples": tree.n_node_samples
-                            }),
-                            path=["Feature"], values="Samples",
-                            title=f"{key_suffix} - Decision Tree Treemap" 
-                        )
-                    elif hasattr(estimator, 'tree_'):
-                        tree = estimator.tree_
-                        fig_tree = px.treemap(
-                            pd.DataFrame({
-                                "Feature": [feature_names[i] if i >= 0 else "Leaf" for i in tree.feature],
-                                "Samples": tree.n_node_samples
-                            }),
-                            path=["Feature"], values="Samples",
-                            title=f"{key_suffix} - Decision Tree Treemap" 
-                        )
-                    else:
-                        st.info("Decision tree visualization not available for this model.")
-                        fig_tree = None
-
-                    if fig_tree is not None:
-                        st.plotly_chart(fig_tree, use_container_width=True)
-                        if cache_for_pdf is not None:
-                            cache_for_pdf[key_suffix]["figs"]["Anchor Tree"] = fig_tree
-
-                with tab5:
-                    mask = np.ones(len(X_train), dtype=bool)
-                    for rule in anchor_rules:
-                        parts = rule.split(" ")
-                        if len(parts) == 3 and parts[1] in ['<=','>']:
-                            f, op, val = parts
-                            val = float(val)
-                            if op == "<=":
-                                mask &= X_train[f] <= val
-                            else:
-                                mask &= X_train[f] > val
-                    neigh_df = X_train[mask]
-                    st.dataframe(neigh_df.head(20))
-
-                    fig_neigh = px.histogram(neigh_df, x=feature_names[0], nbins=20,
-                                            title=f"{key_suffix} - Neighborhood of '{feature_names[0]}'") 
-                    st.plotly_chart(fig_neigh, use_container_width=True)
-                    if cache_for_pdf is not None:
-                        cache_for_pdf[key_suffix]["figs"]["Anchor Neighborhood"] = fig_neigh
-
-            except Exception as e:
-                st.error(f"Anchor Error: {e}")
-
-    # -------------------- Radar Chart --------------------
+    # Radar Chart (PFI veya SHAP varsa)
     if ('PFI' in methods or 'SHAP' in methods):
-        try:
-            with st.expander('📡 Combined Radar'):
-                fig_radar = create_combined_radar(
-                    pfi_imp_df if pfi_imp_df is not None else pd.DataFrame({'Feature':[], 'Importance':[]}), 
-                    shap_imp_df, 
-                    top_k=radar_top_k,
-                    title=f"{key_suffix} - PFI + SHAP Radar" 
-                )
-                st.plotly_chart(fig_radar, use_container_width=True)
-                if cache_for_pdf is not None:
-                    cache_for_pdf[key_suffix]["figs"]["Combined Radar"] = fig_radar
-        except Exception as e:
-            st.error(f'Radar Error: {e}')
+        analyze_radar(pfi_imp_df, shap_imp_df, key_suffix, radar_top_k, cache_for_pdf)
 
 # ---------------------------
 # RUN DASHBOARD

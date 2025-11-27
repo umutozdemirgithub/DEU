@@ -191,7 +191,7 @@ UNIFIED_PARAM_NAMES = {
 # =============================================================================
 # 4. HPO (HYPERPARAMETER OPTIMIZATION) SPACES
 # =============================================================================
-AVAILABLE_HPO_METHODS = ["Random Search", "Grid Search", "Optuna", "Hyperband", "Bayesian Optimization"]
+AVAILABLE_HPO_METHODS = ["Random Search", "Grid Search", "Optuna", "Hyperband", "Bayesian Optimization","Artificial Bee Colony"]
 
 HPO_SPACES = {
     "HistGradientBoosting": {
