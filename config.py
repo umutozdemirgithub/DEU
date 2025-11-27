@@ -7,7 +7,7 @@ import os
 # 1. APPLICATION & UI SETTINGS
 # =============================================================================
 APP_CONFIG = {
-    "page_title": "Auto ML Model Diagnostic Dashboard (Optimized)",
+    "page_title": "Auto ML Model Diagnostic Dashboard",
     "page_layout": "wide",
     "sidebar_title": "AutoML Dashboard",
     "sidebar_icon": os.path.join(os.path.dirname(__file__), "logo.png"),
