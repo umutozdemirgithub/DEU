@@ -63,7 +63,7 @@ import warnings
 import time
 from io import BytesIO
 import plotly.io as pio
-
+import math
 from matplotlib.backends.backend_pdf import PdfPages
 import plotly.figure_factory as ff
 import random
@@ -722,30 +722,24 @@ class ABCHyperparameterOptimizer:
     def _mutate_params(self, current_params, neighbor_params):
         new_params = current_params.copy()
         for k, v in current_params.items():
-            # Numerical Values (excluding Bool)
             if isinstance(v, (int, float, np.number)) and not isinstance(v, bool):
                 phi = random.uniform(-1, 1)
                 neighbor_val = neighbor_params[k]
                 
-                # If neighbor value is None (e.g., max_depth=None), skip mutation
                 if neighbor_val is None:
                     new_params[k] = v
                     continue
 
                 new_val = v + phi * (v - neighbor_val)
                 
-                # Integer Constraint
                 if isinstance(v, (int, np.integer)):
                     new_val = int(round(abs(new_val)))
-                    # For parameters that shouldn't be 0 (e.g., n_estimators, max_depth)
-                    # Generally, tree parameters must be at least 1 or 2.
                     if new_val < 1: new_val = 1
                 else:
-                    new_val = abs(new_val) # If Float, make positive
+                    new_val = abs(new_val) 
                 
                 new_params[k] = new_val
             
-            # Categorical or None Values
             else:
                 if random.random() < 0.5:
                     new_params[k] = neighbor_params[k]
@@ -762,7 +756,6 @@ class ABCHyperparameterOptimizer:
     def fit(self, X, y):
         population = []
         
-        # 1. Initial Population
         for _ in range(self.n_pop):
             params = self._get_random_params()
             score = self._evaluate(params, X, y)
@@ -770,9 +763,7 @@ class ABCHyperparameterOptimizer:
             
         self.best_solution_ = max(population, key=lambda x: x['score'])
         
-        # 2. Main Loop
         for i in range(self.max_iter):
-            # --- EMPLOYED BEES ---
             for j in range(self.n_pop):
                 current = population[j]
                 idxs = list(range(self.n_pop))
@@ -787,7 +778,6 @@ class ABCHyperparameterOptimizer:
                 else:
                     population[j]['trial'] += 1
 
-            # --- ONLOOKER BEES ---
             scores = [p['score'] for p in population]
             valid_scores = [s for s in scores if s != -float('inf')]
             if not valid_scores:
@@ -824,7 +814,6 @@ class ABCHyperparameterOptimizer:
                 else:
                     population[j]['trial'] += 1
 
-            # --- SCOUT BEES ---
             for j in range(self.n_pop):
                 if population[j]['trial'] > self.limit:
                     params = self._get_random_params()
@@ -835,40 +824,420 @@ class ABCHyperparameterOptimizer:
             if current_best['score'] > self.best_solution_['score']:
                 self.best_solution_ = current_best
 
-        # 3. FINAL MODEL TRAINING (SAFE MODE)
         try:
-            # If a valid solution is found, use it
             if self.best_solution_['score'] != -float('inf'):
                 self.estimator.set_params(**self.best_solution_['params'])
                 self.best_estimator_ = self.estimator
                 self.best_estimator_.fit(X, y)
             else:
-                # If no solution is found (all failed), revert to default
                 st.warning("⚠️ ABC Optimization could not find valid parameters. Using default model.")
                 self.best_estimator_ = clone(self.base_estimator_)
                 self.best_estimator_.fit(X, y)
                 
         except Exception as e:
-            # If training still fails with best parameters (e.g., data size issue)
             st.warning(f"⚠️ ABC could not be trained with best parameters ({str(e)}). Reverting to default settings.")
             try:
                 self.best_estimator_ = clone(self.base_estimator_)
                 self.best_estimator_.fit(X, y)
             except Exception as e2:
                 st.error(f"❌ Critical Error: Model could not be trained even with default settings: {e2}")
-                # In the worst-case scenario, leave the current estimator as is (to avoid returning None)
                 self.best_estimator_ = self.estimator 
 
         return self
 
     def _evaluate(self, params, X, y):
         try:
-            # Clone the model so the original is not corrupted
             est = clone(self.estimator)
             est.set_params(**params)
             scores = cross_val_score(est, X, y, cv=self.cv, scoring=self.scoring, n_jobs=-1)
             return scores.mean()
         except Exception:
+            return -float('inf')
+
+    def predict(self, X):
+        return self.best_estimator_.predict(X)
+
+class GeneticHyperparameterOptimizer:
+    """
+    Scikit-learn modelleri için Genetik Algoritma (GA) tabanlı 
+    hiperparametre optimizasyon sınıfı.
+    (Güçlendirilmiş Versiyon: Hata korumalı, Elitizm ve Garanti Fit özellikli)
+    """
+    def __init__(self, estimator, param_distributions, cv, scoring="neg_mean_squared_error", 
+                 n_population=20, max_iter=10, mutation_rate=0.1, crossover_rate=0.8):
+        self.estimator = estimator
+        self.base_estimator_ = clone(estimator)
+        self.param_dist = param_distributions
+        self.cv = cv
+        self.scoring = scoring
+        self.n_pop = n_population
+        self.max_iter = max_iter
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        
+    def _get_random_params(self):
+        """Rastgele bir birey (parametre seti) oluşturur."""
+        params = {}
+        for k, v in self.param_dist.items():
+            if hasattr(v, "rvs"):
+                val = v.rvs()
+                if isinstance(val, (np.integer, np.int64, np.int32)):
+                    val = int(val)
+                params[k] = val
+            elif isinstance(v, list):
+                params[k] = random.choice(v)
+            else:
+                params[k] = v
+        return params
+
+    def _crossover(self, parent1, parent2):
+        """İki ebeveynden yeni bir çocuk (parametre seti) üretir."""
+        child = parent1.copy()
+        for k in parent1.keys():
+            if random.random() < 0.5:
+                child[k] = parent2[k]
+        return child
+
+    def _mutate(self, params):
+        """Bireyin genlerinde rastgele değişiklik yapar."""
+        mutated = params.copy()
+        for k, v in params.items():
+            if random.random() < self.mutation_rate:
+                if isinstance(v, (int, float, np.number)) and not isinstance(v, bool):
+                    change = v * 0.2 * random.uniform(-1, 1)
+                    if change == 0: change = random.uniform(-0.1, 0.1) 
+                    new_val = v + change
+                    
+                    if isinstance(v, (int, np.integer)):
+                        new_val = int(round(abs(new_val)))
+                        if new_val < 1: new_val = 1
+                    else:
+                        new_val = abs(new_val)
+                    mutated[k] = new_val
+                
+                else:
+                    if hasattr(self.param_dist[k], "rvs"):
+                        val = self.param_dist[k].rvs()
+                        if isinstance(val, (np.integer, np.int64)): val = int(val)
+                        mutated[k] = val
+                    elif isinstance(self.param_dist[k], list):
+                        mutated[k] = random.choice(self.param_dist[k])
+        return mutated
+
+    def fit(self, X, y):
+        population = []
+        for _ in range(self.n_pop):
+            params = self._get_random_params()
+            score = self._evaluate(params, X, y)
+            population.append({'params': params, 'score': score})
+
+        self.best_solution_ = max(population, key=lambda x: x['score'])
+
+        for generation in range(self.max_iter):
+            population.sort(key=lambda x: x['score'], reverse=True)
+            
+            elite_count = int(self.n_pop * 0.2)
+            new_population = population[:elite_count]
+            
+            while len(new_population) < self.n_pop:
+                candidates = random.sample(population, 3)
+                parent1 = max(candidates, key=lambda x: x['score'])['params']
+                candidates = random.sample(population, 3)
+                parent2 = max(candidates, key=lambda x: x['score'])['params']
+                
+                if random.random() < self.crossover_rate:
+                    child_params = self._crossover(parent1, parent2)
+                else:
+                    child_params = parent1
+                
+                child_params = self._mutate(child_params)
+                
+                score = self._evaluate(child_params, X, y)
+                new_population.append({'params': child_params, 'score': score})
+            
+            population = new_population
+            
+            current_best = max(population, key=lambda x: x['score'])
+            if current_best['score'] > self.best_solution_['score']:
+                self.best_solution_ = current_best
+
+        try:
+            if self.best_solution_['score'] != -float('inf'):
+                self.estimator.set_params(**self.best_solution_['params'])
+                self.best_estimator_ = self.estimator
+                self.best_estimator_.fit(X, y)
+            else:
+                st.warning("⚠️ GA geçerli parametre bulamadı. Varsayılan model kullanılıyor.")
+                self.best_estimator_ = clone(self.base_estimator_)
+                self.best_estimator_.fit(X, y)
+        except Exception as e:
+            st.warning(f"⚠️ GA en iyi parametrelerle eğitilemedi. Varsayılana dönülüyor. Hata: {e}")
+            self.best_estimator_ = self.estimator 
+            
+        return self
+
+    def _evaluate(self, params, X, y):
+        try:
+            est = clone(self.estimator)
+            est.set_params(**params)
+            scores = cross_val_score(est, X, y, cv=self.cv, scoring=self.scoring, n_jobs=-1)
+            return scores.mean()
+        except:
+            return -float('inf')
+
+    def predict(self, X):
+        return self.best_estimator_.predict(X)
+
+class PSOHyperparameterOptimizer:
+    """
+    Parçacık Sürü Optimizasyonu (PSO) tabanlı hiperparametre optimizasyon sınıfı.
+    (Güçlendirilmiş Versiyon: Hata korumalı)
+    """
+    def __init__(self, estimator, param_distributions, cv, scoring="neg_mean_squared_error", 
+                 n_particles=10, max_iter=10, c1=1.5, c2=1.5, w=0.7):
+        self.estimator = estimator
+        self.base_estimator_ = clone(estimator)
+        self.param_dist = param_distributions
+        self.cv = cv
+        self.scoring = scoring
+        self.n_particles = n_particles
+        self.max_iter = max_iter
+        self.c1 = c1 
+        self.c2 = c2 
+        self.w = w  
+
+    def _get_random_params(self):
+        """Rastgele bir parçacık konumu oluşturur."""
+        params = {}
+        for k, v in self.param_dist.items():
+            if hasattr(v, "rvs"):
+                val = v.rvs()
+                if isinstance(val, (np.integer, np.int64, np.int32)): val = int(val)
+                params[k] = val
+            elif isinstance(v, list):
+                params[k] = random.choice(v)
+            else:
+                params[k] = v
+        return params
+
+    def _update_particle(self, current_params, p_best_params, g_best_params):
+        """
+        PSO Hız ve Konum Güncelleme Mantığı:
+        Sayısal değerler için standart PSO formülü uygulanır.
+        Kategorik değerler için 'olasılıksal' geçiş yapılır.
+        """
+        new_params = current_params.copy()
+        
+        for k, v in current_params.items():
+            if isinstance(v, (int, float, np.number)) and not isinstance(v, bool):
+                p_best_val = p_best_params[k]
+                g_best_val = g_best_params[k]
+                
+                r1, r2 = random.random(), random.random()
+                
+                cognitive_velocity = self.c1 * r1 * (p_best_val - v)
+                social_velocity = self.c2 * r2 * (g_best_val - v)
+                inertia = self.w * (random.uniform(-1, 1) * v * 0.1) 
+                
+                new_val = v + cognitive_velocity + social_velocity + inertia
+                
+                if isinstance(v, (int, np.integer)):
+                    new_val = int(round(abs(new_val)))
+                    if new_val < 1: new_val = 1
+                else:
+                    new_val = abs(new_val)
+                
+                new_params[k] = new_val
+
+            else:
+                roll = random.random()
+                if roll < 0.3:
+                    new_params[k] = g_best_params[k]
+                elif roll < 0.6:
+                    new_params[k] = p_best_params[k]
+                else:
+                    new_params[k] = v 
+                    
+        return new_params
+
+    def fit(self, X, y):
+        particles = []
+        
+        for _ in range(self.n_particles):
+            params = self._get_random_params()
+            score = self._evaluate(params, X, y)
+            particles.append({
+                'current_params': params,
+                'current_score': score,
+                'p_best_params': params,
+                'p_best_score': score
+            })
+            
+        g_best = max(particles, key=lambda x: x['p_best_score'])
+        g_best_params = g_best['p_best_params']
+        g_best_score = g_best['p_best_score']
+
+        for i in range(self.max_iter):
+            for p in particles:
+                new_params = self._update_particle(p['current_params'], p['p_best_params'], g_best_params)
+                new_score = self._evaluate(new_params, X, y)
+                
+                p['current_params'] = new_params
+                p['current_score'] = new_score
+                
+                if new_score > p['p_best_score']:
+                    p['p_best_params'] = new_params
+                    p['p_best_score'] = new_score
+                    
+                    if new_score > g_best_score:
+                        g_best_score = new_score
+                        g_best_params = new_params
+
+        self.best_solution_ = {'params': g_best_params, 'score': g_best_score}
+
+        try:
+            if self.best_solution_['score'] != -float('inf'):
+                self.estimator.set_params(**self.best_solution_['params'])
+                self.best_estimator_ = self.estimator
+                self.best_estimator_.fit(X, y)
+            else:
+                st.warning("⚠️ PSO geçerli parametre bulamadı. Varsayılan kullanılıyor.")
+                self.best_estimator_ = clone(self.base_estimator_)
+                self.best_estimator_.fit(X, y)
+        except Exception as e:
+            st.warning(f"⚠️ PSO hatası: {e}. Varsayılan modele dönülüyor.")
+            self.best_estimator_ = self.estimator
+            
+        return self
+
+    def _evaluate(self, params, X, y):
+        try:
+            est = clone(self.estimator)
+            est.set_params(**params)
+            scores = cross_val_score(est, X, y, cv=self.cv, scoring=self.scoring, n_jobs=-1)
+            return scores.mean()
+        except:
+            return -float('inf')
+    
+    def predict(self, X):
+        return self.best_estimator_.predict(X)
+
+class SimulatedAnnealingOptimizer:
+    """
+    Benzetilmiş Tavlama (Simulated Annealing - SA) tabanlı 
+    hiperparametre optimizasyon sınıfı.
+    """
+    def __init__(self, estimator, param_distributions, cv, scoring="neg_mean_squared_error", 
+                 max_iter=50, initial_temp=10.0, cooling_rate=0.9):
+        self.estimator = estimator
+        self.base_estimator_ = clone(estimator)
+        self.param_dist = param_distributions
+        self.cv = cv
+        self.scoring = scoring
+        self.max_iter = max_iter
+        self.initial_temp = initial_temp
+        self.cooling_rate = cooling_rate
+
+    def _get_random_params(self):
+        params = {}
+        for k, v in self.param_dist.items():
+            if hasattr(v, "rvs"):
+                val = v.rvs()
+                if isinstance(val, (np.integer, np.int64, np.int32)): val = int(val)
+                params[k] = val
+            elif isinstance(v, list):
+                params[k] = random.choice(v)
+            else:
+                params[k] = v
+        return params
+
+    def _get_neighbor(self, params):
+        """Mevcut çözümün yakınında rastgele bir komşu türetir (Mutasyon benzeri)."""
+        neighbor = params.copy()
+        keys = list(params.keys())
+        k = random.choice(keys)
+        v = params[k]
+        
+        if isinstance(v, (int, float, np.number)) and not isinstance(v, bool):
+            change = v * 0.3 * random.uniform(-1, 1)
+            if change == 0: change = random.uniform(-0.1, 0.1)
+            new_val = v + change
+            
+            if isinstance(v, (int, np.integer)):
+                new_val = int(round(abs(new_val)))
+                if new_val < 1: new_val = 1
+            else:
+                new_val = abs(new_val)
+            neighbor[k] = new_val
+            
+        else:
+            if hasattr(self.param_dist[k], "rvs"):
+                val = self.param_dist[k].rvs()
+                if isinstance(val, (np.integer, np.int64)): val = int(val)
+                neighbor[k] = val
+            elif isinstance(self.param_dist[k], list):
+                neighbor[k] = random.choice(self.param_dist[k])
+                
+        return neighbor
+
+    def fit(self, X, y):
+        current_params = self._get_random_params()
+        current_score = self._evaluate(current_params, X, y)
+        
+        best_params = current_params
+        best_score = current_score
+        
+        temperature = self.initial_temp
+        
+        for i in range(self.max_iter):
+            neighbor_params = self._get_neighbor(current_params)
+            neighbor_score = self._evaluate(neighbor_params, X, y)
+            
+            delta = neighbor_score - current_score
+            
+            if delta > 0:
+                accept = True
+            else:
+                try:
+                    prob = math.exp(delta / temperature)
+                except OverflowError:
+                    prob = 0
+                accept = random.random() < prob
+            
+            if accept:
+                current_params = neighbor_params
+                current_score = neighbor_score
+                
+                if current_score > best_score:
+                    best_score = current_score
+                    best_params = current_params
+            
+            temperature *= self.cooling_rate
+            
+        self.best_solution_ = {'params': best_params, 'score': best_score}
+
+        try:
+            if self.best_solution_['score'] != -float('inf'):
+                self.estimator.set_params(**self.best_solution_['params'])
+                self.best_estimator_ = self.estimator
+                self.best_estimator_.fit(X, y)
+            else:
+                st.warning("⚠️ SA geçerli parametre bulamadı. Varsayılan kullanılıyor.")
+                self.best_estimator_ = clone(self.base_estimator_)
+                self.best_estimator_.fit(X, y)
+        except Exception as e:
+            st.warning(f"⚠️ SA hatası: {e}. Varsayılana dönülüyor.")
+            self.best_estimator_ = self.estimator
+            
+        return self
+
+    def _evaluate(self, params, X, y):
+        try:
+            est = clone(self.estimator)
+            est.set_params(**params)
+            scores = cross_val_score(est, X, y, cv=self.cv, scoring=self.scoring, n_jobs=-1)
+            return scores.mean()
+        except:
             return -float('inf')
 
     def predict(self, X):
@@ -912,6 +1281,67 @@ def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scale
             
             abc_opt.fit(X_train, y_train)
             return abc_opt.best_estimator_
+
+    elif method == "Genetic Algorithm":
+            model_spaces = config.HPO_SPACES.get(model_name, {})
+            selected_space = model_spaces.get("random", {}) 
+            
+            if not selected_space:
+                pipeline.fit(X_train, y_train)
+                return pipeline
+                
+            st.toast(f"🧬 GA Evolving: {model_name}...", icon="🧬")
+            
+            ga_opt = GeneticHyperparameterOptimizer(
+                estimator=pipeline,
+                param_distributions=selected_space,
+                cv=cv_strategy,
+                n_population=10, 
+                max_iter=5
+            )
+            ga_opt.fit(X_train, y_train)
+            return ga_opt.best_estimator_
+
+    elif method == "Particle Swarm Optimization":
+        model_spaces = config.HPO_SPACES.get(model_name, {})
+        selected_space = model_spaces.get("random", {})
+        
+        if not selected_space:
+            pipeline.fit(X_train, y_train)
+            return pipeline
+            
+        st.toast(f"🕊️ PSO Swarming: {model_name}...", icon="🕊️")
+        
+        pso_opt = PSOHyperparameterOptimizer(
+            estimator=pipeline,
+            param_distributions=selected_space,
+            cv=cv_strategy,
+            n_particles=10, 
+            max_iter=5
+        )
+        pso_opt.fit(X_train, y_train)
+        return pso_opt.best_estimator_
+
+    elif method == "Simulated Annealing":
+        model_spaces = config.HPO_SPACES.get(model_name, {})
+        selected_space = model_spaces.get("random", {})
+        
+        if not selected_space:
+            pipeline.fit(X_train, y_train)
+            return pipeline
+            
+        st.toast(f"🔥 SA Annealing: {model_name}...", icon="🔥")
+        
+        sa_opt = SimulatedAnnealingOptimizer(
+            estimator=pipeline,
+            param_distributions=selected_space,
+            cv=cv_strategy,
+            max_iter=20,     
+            initial_temp=10, 
+            cooling_rate=0.85 
+        )
+        sa_opt.fit(X_train, y_train)
+        return sa_opt.best_estimator_
 
     # =========================================================
     # OPTUNA and HYPERBAND INTEGRATION
