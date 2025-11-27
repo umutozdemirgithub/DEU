@@ -1,3 +1,4 @@
+
 # config.py
 import numpy as np
 from scipy import stats
@@ -24,6 +25,7 @@ DATA_CONFIG = {
     "outlier_methods": ["IQR Capping", "Z-Score Capping", "Isolation Forest Drop"],
     "scaling_methods": ["Min-Max Scaling (0-1)", "Standard Scaling (Z-Score)", "Robust Scaling (IQR based)", "MaxAbs Scaling (-1 to 1)", "Log Transformation (np.log1p)"]
 }
+
 # =============================================================================
 # 3. MODELS AND DEFAULT PARAMETERS
 # =============================================================================
@@ -189,6 +191,8 @@ UNIFIED_PARAM_NAMES = {
 # =============================================================================
 # 4. HPO (HYPERPARAMETER OPTIMIZATION) SPACES
 # =============================================================================
+AVAILABLE_HPO_METHODS = ["Random Search", "Grid Search", "Optuna", "Hyperband", "Bayesian Optimization"]
+
 HPO_SPACES = {
     "HistGradientBoosting": {
         "random": {
@@ -441,7 +445,19 @@ METRICS_CONFIG = {
     "defaults": ["MSE", "RMSE", "R2", "Adj_R2"]
 }
 
-DIAGNOSTIC_PLOTS = ["Advanced Scatter", "Residuals", "Distribution", "QQ Plot", "Influence", "Anomalies", "Overfitting Check"]
+DIAGNOSTIC_PLOTS = [
+    "Advanced Scatter",
+    "Residuals",
+    "Distribution",
+    "QQ Plot",
+    "Influence",
+    "Anomalies",
+    "Overfitting Check",
+    "Residual vs Actual",
+    "Error Bands",
+    "KDE Distribution",
+    "Bubble Influence"
+]
 
 DIAGNOSTIC_DEFAULTS = ["Advanced Scatter", "Overfitting Check"]
 

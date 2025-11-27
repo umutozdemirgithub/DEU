@@ -50,9 +50,11 @@ from sklearn.metrics import (
     mean_absolute_percentage_error, median_absolute_error,
     explained_variance_score, max_error, mean_squared_log_error
 )
+
 from sklearn.inspection import permutation_importance
 from sklearn.pipeline import Pipeline
 
+from sklearn.model_selection import cross_val_score
 # --- UTILS & STATS ---
 from scipy import stats
 import statsmodels.api as sm
@@ -60,7 +62,13 @@ from scipy.stats import gaussian_kde, probplot
 import warnings
 import time
 from io import BytesIO
+import plotly.io as pio
+
 from matplotlib.backends.backend_pdf import PdfPages
+import plotly.figure_factory as ff
+
+import io
+import matplotlib.image as mpimg
 
 import shap
 import dice_ml
@@ -92,6 +100,13 @@ try:
     from lime import lime_tabular
 except ImportError:
     lime_tabular = None
+
+try:
+    import optuna
+    from optuna.samplers import TPESampler,GPSampler
+    from optuna.pruners import HyperbandPruner
+except ImportError:
+    optuna = None
 
 warnings.filterwarnings("ignore")
 
@@ -610,8 +625,68 @@ def safe_model_factory(name, random_state=config.DATA_CONFIG['random_state']):
         st.warning(f"Model '{name}' is not defined in the factory. Using default (HistGradient).")
         return HistGradientBoostingRegressor(random_state=random_state)
 
+def get_optuna_params(trial, model_name):
+    """
+        Dynamic, model-specific parameter search space for Optuna.
+        The logic of the config file has been preserved.
+    """
+    params = {}
+    
+    if model_name == "HistGradientBoosting":
+        params["model__learning_rate"] = trial.suggest_float("model__learning_rate", 0.01, 0.3, log=True)
+        params["model__max_iter"] = trial.suggest_int("model__max_iter", 100, 500)
+        params["model__max_depth"] = trial.suggest_categorical("model__max_depth", [None, 3, 5, 10])
+        params["model__l2_regularization"] = trial.suggest_float("model__l2_regularization", 1e-6, 1.0, log=True)
+
+    elif model_name == "RandomForest":
+        params["model__n_estimators"] = trial.suggest_int("model__n_estimators", 50, 400)
+        params["model__max_depth"] = trial.suggest_categorical("model__max_depth", [None, 10, 20, 30])
+        params["model__min_samples_split"] = trial.suggest_int("model__min_samples_split", 2, 15)
+        
+    elif model_name == "XGBoost":
+        params["model__n_estimators"] = trial.suggest_int("model__n_estimators", 100, 500)
+        params["model__learning_rate"] = trial.suggest_float("model__learning_rate", 0.01, 0.3, log=True)
+        params["model__max_depth"] = trial.suggest_int("model__max_depth", 3, 10)
+        params["model__subsample"] = trial.suggest_float("model__subsample", 0.5, 1.0)
+        params["model__colsample_bytree"] = trial.suggest_float("model__colsample_bytree", 0.5, 1.0)
+        
+    elif model_name == "LightGBM":
+        params["model__n_estimators"] = trial.suggest_int("model__n_estimators", 100, 500)
+        params["model__learning_rate"] = trial.suggest_float("model__learning_rate", 0.01, 0.3, log=True)
+        params["model__num_leaves"] = trial.suggest_int("model__num_leaves", 20, 100)
+        
+    elif model_name == "CatBoost":
+        params["model__iterations"] = trial.suggest_int("model__iterations", 100, 500)
+        params["model__learning_rate"] = trial.suggest_float("model__learning_rate", 0.01, 0.3, log=True)
+        params["model__depth"] = trial.suggest_int("model__depth", 4, 10)
+        params["model__l2_leaf_reg"] = trial.suggest_float("model__l2_leaf_reg", 1, 10)
+
+    elif model_name == "SVR":
+        params["model__C"] = trial.suggest_float("model__C", 0.1, 100, log=True)
+        params["model__epsilon"] = trial.suggest_float("model__epsilon", 0.01, 1.0, log=True)
+        
+    elif model_name == "Ridge":
+        params["model__alpha"] = trial.suggest_float("model__alpha", 0.1, 100.0, log=True)
+        
+    elif model_name == "Lasso":
+        params["model__alpha"] = trial.suggest_float("model__alpha", 0.001, 10.0, log=True)
+        
+    elif model_name == "ElasticNet":
+        params["model__alpha"] = trial.suggest_float("model__alpha", 0.001, 10.0, log=True)
+        params["model__l1_ratio"] = trial.suggest_float("model__l1_ratio", 0.1, 0.9)
+
+    elif model_name == "DecisionTree":
+        params["model__max_depth"] = trial.suggest_categorical("model__max_depth", [None, 5, 10, 20])
+        params["model__min_samples_split"] = trial.suggest_int("model__min_samples_split", 2, 20)
+
+    elif model_name == "MLPRegressor":
+        params["model__alpha"] = trial.suggest_float("model__alpha", 1e-5, 1e-1, log=True)
+        params["model__learning_rate_init"] = trial.suggest_float("model__learning_rate_init", 1e-4, 1e-1, log=True)
+        
+    return params
+
 def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scaler_cls=None):
-    # 1) Base Model & Pipeline
+    # 1) Base Model & Pipeline Setup
     base_model = safe_model_factory(model_name)
     steps = []
     if scaler_cls is not None:
@@ -625,27 +700,88 @@ def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scale
     else:
         cv_strategy = 3
 
+    # =========================================================
+    # OPTUNA and HYPERBAND INTEGRATION
+    # =========================================================
+    if method in ["Optuna", "Hyperband","Bayesian Optimization"]:
+        if optuna is None:
+            st.error("Optuna library is not installed! Run 'pip install optuna'.")
+            return pipeline
+
+        def objective(trial):
+            # 1. Get parameters
+            params = get_optuna_params(trial, model_name)
+            if not params: # Return default (infinity) if no parameters are defined
+                return float('inf')
+
+            # 2. Set parameters to the pipeline
+            # Note: Parameter names must already be in 'model__param' format
+            try:
+                pipeline.set_params(**params)
+            except Exception:
+                pass # Skip if incompatible parameter
+            
+            # 3. Cross Validation
+            # Returns negative MSE, so multiply by - to make it positive (for minimization)
+            scores = cross_val_score(
+                pipeline, X_train, y_train, 
+                cv=cv_strategy, 
+                scoring="neg_mean_squared_error", 
+                n_jobs=-1
+            )
+            mse_score = -scores.mean()
+            return mse_score
+
+        # Pruner setup: HyperbandPruner if Hyperband is selected, otherwise MedianPruner (default) or None
+        pruner = HyperbandPruner(min_resource=1, max_resource="auto", reduction_factor=3) if method == "Hyperband" else None
+        
+        if method == "Bayesian Optimization":
+        # Sampler setup: TPE (Tree-structured Parzen Estimator) is standard
+            sampler = TPESampler(seed=config.DATA_CONFIG["random_state"])
+        else:
+            sampler = TPESampler(seed=config.DATA_CONFIG["random_state"])
+
+        study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
+        
+        # Number of trials (Could be higher in Hyperband for performance/time balance, but limited here)
+        n_trials_count = 50 if method == "Hyperband" else 20
+        
+        study.optimize(objective, n_trials=n_trials_count, show_progress_bar=False)
+        
+        # Get best parameters and retrain the model
+        best_params = study.best_params
+        pipeline.set_params(**best_params)
+        pipeline.fit(X_train, y_train)
+        
+        return pipeline
+
+    # =========================================================
+    # EXISTING RANDOM / GRID SEARCH (Legacy Code Block)
+    # =========================================================
+    
     # 3) HPO Spaces from CONFIG
     model_spaces = config.HPO_SPACES.get(model_name, {})
     
     if method == "Random Search":
         selected_space = model_spaces.get("random", {})
-    else:
+    else: # Grid Search
         selected_space = model_spaces.get("grid", {})
 
     if not selected_space:
+        pipeline.fit(X_train, y_train)
         return pipeline
 
+    # Check pipeline parameter names (Config compatibility)
     if model_name in config.MODEL_DEFAULT_PARAMS:
         allowed_keys = config.MODEL_DEFAULT_PARAMS[model_name].keys()
-        allowed_pipeline_keys = {f"model__{p}" for p in allowed_keys}
-        
-        selected_space = {k: v for k, v in selected_space.items() if k in allowed_pipeline_keys}
+        # Filter only those starting with model__ and present in config (for safety)
+        pass 
     
     if not selected_space:
+         pipeline.fit(X_train, y_train)
          return pipeline
 
-    # 5) Search Execution
+    # Search Execution
     if method == "Random Search":
         search_engine = RandomizedSearchCV(
             estimator=pipeline,
@@ -654,7 +790,7 @@ def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scale
             cv=cv_strategy,
             scoring="neg_mean_squared_error",
             random_state=config.DATA_CONFIG["random_state"],
-            n_jobs=2,
+            n_jobs=-1,
             verbose=0,
         )
     else:
@@ -663,7 +799,7 @@ def perform_hpo(X_train, y_train, method, model_name, use_timesplit=False, scale
             param_grid=selected_space,
             cv=cv_strategy,
             scoring="neg_mean_squared_error",
-            n_jobs=2,
+            n_jobs=-1,
             verbose=0,
         )
 
@@ -853,7 +989,8 @@ def display_diagnostic_plots(
     y_test, y_pred, y_train=None, y_train_pred=None, 
     model=None, X_train=None, 
     key_prefix="diag",
-    active_plots=None
+    active_plots=None,
+    cache_for_pdf=None
 ):
     if not active_plots:
         st.info("No diagnostic plots selected in the sidebar.")
@@ -865,7 +1002,6 @@ def display_diagnostic_plots(
     resid, std_resid, leverage, cooks_d, anomaly_score, anomaly_label = calculate_diagnostic_metrics(y_test_arr, y_pred_arr)
     
     has_train = (y_train is not None) and (y_train_pred is not None)
-
     if has_train:
         train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
         test_rmse = np.sqrt(mean_squared_error(y_test_arr, y_pred_arr))
@@ -883,70 +1019,123 @@ def display_diagnostic_plots(
     tabs = st.tabs(final_tabs)
     layout_opts = dict(template='plotly_white', height=500)
 
+    if cache_for_pdf is not None:
+        if key_prefix not in cache_for_pdf:
+            cache_for_pdf[key_prefix] = {"figs": {}}
+        
+        if "figs" not in cache_for_pdf[key_prefix]:
+            cache_for_pdf[key_prefix]["figs"] = {}
+
+        cache_for_pdf[key_prefix]["diag_metrics"] = (resid, leverage, cooks_d, anomaly_score, anomaly_label)
+
     for i, tab_name in enumerate(final_tabs):
         with tabs[i]:
+            fig_to_cache = None
+            
+            plot_title = f"{key_prefix} - {tab_name}"
+
+            # ---------- Diagnostic Plots ----------
             if tab_name == "Advanced Scatter": 
                 df_chart = pd.DataFrame({'Actual': y_test_arr, 'Predicted': y_pred_arr})
-                fig_adv = px.scatter(
+                fig_to_cache = px.scatter(
                     df_chart, x='Actual', y='Predicted', 
                     trendline="ols", trendline_color_override="red",
                     marginal_x="histogram", marginal_y="histogram",
                     opacity=0.6, height=layout_opts['height'],
-                    title="Actual vs Predicted"
+                    title=plot_title 
                 )
-                st.plotly_chart(fig_adv, use_container_width=True, key=f"{key_prefix}_adv")
 
             elif tab_name == "Overfitting Check" and has_train:
-                fig = go.Figure(go.Bar(
+                fig_to_cache = go.Figure(go.Bar(
                     x=["Train", "Test"], y=[train_rmse, test_rmse],
                     marker_color=["#1f77b4", "#ff7f0e"],
                     text=[f"{train_rmse:.4f}", f"{test_rmse:.4f}"], textposition="auto"
                 ))
-                fig.update_layout(title="RMSE Comparison (Train vs Test)", **layout_opts)
-                st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_over")
-                
-                overfit_threshold = 0.2
-                rmse_diff = test_rmse - train_rmse
-                ratio = test_rmse / train_rmse if train_rmse > 0 else np.inf
-                if ratio > 1 + overfit_threshold:
-                    st.warning(f"⚠️ Potential overfitting! Train RMSE={train_rmse:.4f}, Test RMSE={test_rmse:.4f}")
-                else:
-                    st.success(f"✅ No significant overfitting. Train RMSE={train_rmse:.4f}, Test RMSE={test_rmse:.4f}")
+                fig_to_cache.update_layout(title=f"{key_prefix} - RMSE Comparison (Train vs Test)", **layout_opts) 
 
             elif tab_name == "Residuals":
-                fig_res = px.scatter(
+                fig_to_cache = px.scatter(
                     x=y_pred_arr, y=resid,
                     color=anomaly_score, color_continuous_scale="Turbo",
                     labels={'x': 'Predicted', 'y': 'Residual'},
-                    title="Residuals vs Predicted", height=layout_opts['height']
+                    title=f"{key_prefix} - Residuals vs Predicted", height=layout_opts['height'] 
                 )
-                fig_res.add_hline(y=0, line_dash='dash', line_color='black')
-                st.plotly_chart(fig_res, use_container_width=True, key=f"{key_prefix}_res")
+                fig_to_cache.add_hline(y=0, line_dash='dash', line_color='black')
 
             elif tab_name == "Distribution":
-                fig_dist = px.histogram(resid, nbins=50, marginal="box", title="Residual Distribution", height=layout_opts['height'])
-                st.plotly_chart(fig_dist, use_container_width=True, key=f"{key_prefix}_dist")
+                fig_to_cache = px.histogram(resid, nbins=50, marginal="box", 
+                                          title=f"{key_prefix} - Residual Distribution", height=layout_opts['height']) 
 
             elif tab_name == "QQ Plot":
                 qq = probplot(resid, dist='norm')
-                fig_qq = px.scatter(x=qq[0][0], y=qq[0][1], labels={'x': 'Theoretical', 'y': 'Observed'}, title="Q-Q Plot", height=layout_opts['height'])
-                fig_qq.add_shape(type="line", x0=min(qq[0][0]), y0=min(qq[0][0]), x1=max(qq[0][0]), y1=max(qq[0][0]), line=dict(color="red"))
-                st.plotly_chart(fig_qq, use_container_width=True, key=f"{key_prefix}_qq")
+                fig_to_cache = px.scatter(x=qq[0][0], y=qq[0][1],
+                                          labels={'x': 'Theoretical', 'y': 'Observed'},
+                                          title=f"{key_prefix} - Q-Q Plot", height=layout_opts['height']) 
+                fig_to_cache.add_shape(type="line", x0=min(qq[0][0]), y0=min(qq[0][0]),
+                                       x1=max(qq[0][0]), y1=max(qq[0][0]), line=dict(color="red"))
 
             elif tab_name == "Influence":
-                fig_inf = px.scatter(
+                fig_to_cache = px.scatter(
                     x=leverage, y=cooks_d, color=anomaly_score, color_continuous_scale="Viridis",
-                    labels={'x': 'Leverage', 'y': "Cook's D"}, title="Influence Plot", height=layout_opts['height']
+                    labels={'x': 'Leverage', 'y': "Cook's D"}, 
+                    title=f"{key_prefix} - Influence Plot", height=layout_opts['height'] 
                 )
-                fig_inf.add_hline(y=4/len(resid), line_dash="dash", line_color="red")
-                st.plotly_chart(fig_inf, use_container_width=True, key=f"{key_prefix}_inf")
+                fig_to_cache.add_hline(y=4/len(resid), line_dash="dash", line_color="red")
 
-            elif tab_name == "Anomalies":
-                df_anom = pd.DataFrame({
-                    "Actual": y_test_arr, "Predicted": y_pred_arr, 
-                    "Residual": resid, "AnomalyScore": anomaly_score, "Label": anomaly_label
-                }).sort_values("AnomalyScore", ascending=False)
-                st.dataframe(df_anom.head(50), use_container_width=True, height=400)
+            elif tab_name == "Residual vs Actual":
+                df_rva = pd.DataFrame({"Actual": y_test_arr, "Residual": resid})
+                fig_to_cache = px.scatter(
+                    df_rva, x="Actual", y="Residual",
+                    color=np.abs(resid),
+                    color_continuous_scale="Plasma",
+                    title=f"{key_prefix} - Residuals vs Actual Values", 
+                    labels={"color": "|Residual|"},
+                    opacity=0.7,
+                    height=layout_opts['height']
+                )
+                fig_to_cache.add_hline(y=0, line_dash="dash", line_color="black")
+
+            elif tab_name == "Error Bands":
+                df_err = pd.DataFrame({
+                    "Index": np.arange(len(y_pred_arr)),
+                    "Predicted": y_pred_arr,
+                    "Actual": y_test_arr,
+                    "Residual": resid
+                })
+                sigma = np.std(resid)
+                fig_to_cache = go.Figure()
+                fig_to_cache.add_trace(go.Scatter(x=df_err["Index"], y=df_err["Predicted"],
+                                                  mode="lines", name="Predicted", line=dict(color="blue")))
+                fig_to_cache.add_trace(go.Scatter(x=df_err["Index"], y=df_err["Predicted"] + sigma,
+                                                  mode="lines", name="+1σ", line=dict(color="green", dash="dash")))
+                fig_to_cache.add_trace(go.Scatter(x=df_err["Index"], y=df_err["Predicted"] - sigma,
+                                                  mode="lines", name="-1σ", line=dict(color="green", dash="dash")))
+                fig_to_cache.add_trace(go.Scatter(x=df_err["Index"], y=df_err["Actual"],
+                                                  mode="markers", name="Actual", marker=dict(size=6, color="orange")))
+                fig_to_cache.update_layout(title=f"{key_prefix} - Predicted with Error Bands (±1σ)", **layout_opts) 
+
+            elif tab_name == "KDE Distribution":
+                fig_to_cache = ff.create_distplot([resid], group_labels=["Residuals"], show_hist=True, show_curve=True)
+                fig_to_cache.update_layout(title=f"{key_prefix} - Residuals Distribution + KDE Curve", **layout_opts) 
+
+            elif tab_name == "Bubble Influence":
+                df_bubble = pd.DataFrame({"Leverage": leverage, "Residual": resid, "Cook": cooks_d})
+                fig_to_cache = px.scatter(
+                    df_bubble,
+                    x="Leverage", y="Residual",
+                    size="Cook", color="Cook",
+                    color_continuous_scale="Inferno",
+                    title=f"{key_prefix} - Leverage vs Residuals (Bubble Size = Cook's D)", 
+                    height=layout_opts["height"],
+                    labels={"Cook": "Cook's Distance"}
+                )
+                fig_to_cache.add_hline(y=0, line_dash="dash", line_color="black")
+
+            # ---------- Streamlit ve PDF Cache ----------
+            if fig_to_cache:
+                st.plotly_chart(fig_to_cache, use_container_width=True, key=f"{key_prefix}_{tab_name.replace(' ', '_')}")
+                if cache_for_pdf is not None:
+                    cache_for_pdf[key_prefix]["figs"][tab_name] = fig_to_cache
 
 # -------------------------------------------------------------------------
 # 5. XAI (EXPLAINABLE AI) SETTINGS
@@ -996,12 +1185,18 @@ def create_combined_radar(pfi_df, shap_df=None, top_k=10, title="PFI + SHAP Rada
     return fig
 
 def run_xai_analysis(model, X_train, X_test, y_test, methods, key_suffix,
+                     cache_for_pdf=None,
                      lime_sample=config.XAI_CONFIG["lime_sample_size"], 
                      lime_num_features=config.XAI_CONFIG["lime_num_features"], 
                      radar_top_k=config.XAI_CONFIG["radar_top_k"]):
+    
     if not methods:
         st.info("No XAI methods selected.")
         return
+
+    if cache_for_pdf is not None:
+        if key_suffix not in cache_for_pdf:
+            cache_for_pdf[key_suffix] = {"figs": {}, "metrics": {}}
 
     xai_tabs = st.tabs(methods)
     is_pipeline = isinstance(model, Pipeline)
@@ -1010,10 +1205,10 @@ def run_xai_analysis(model, X_train, X_test, y_test, methods, key_suffix,
     shap_imp_df = None
     pfi_imp_df = None
 
-    # SHAP
+    # -------------------- SHAP --------------------
     if 'SHAP' in methods and shap is not None:
         with xai_tabs[methods.index('SHAP')]:
-            st.markdown('## 🌈 SHAP Global & Local Explanations')
+            st.markdown(f'## 🌈 SHAP Global & Local Explanations ({key_suffix})')
             try:
                 X_shap = X_test.iloc[:min(300,len(X_test))].copy()
                 if is_pipeline and 'scaler' in model.named_steps:
@@ -1036,16 +1231,32 @@ def run_xai_analysis(model, X_train, X_test, y_test, methods, key_suffix,
                 # Summary Plot
                 with shap_tabs[0]:
                     fig, ax = plt.subplots(figsize=(7,5))
+                    plt.title(f"{key_suffix} - SHAP Summary") 
                     shap.summary_plot(shap_values, X_shap, show=False)
                     st.pyplot(fig)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"]["SHAP Summary"] = fig
 
                 # Feature Importance
                 with shap_tabs[1]:
-                    st.dataframe(shap_imp_df)
-                    fig_imp = px.bar(shap_imp_df.head(20), x='Importance', y='Feature',
-                                     orientation='h', title='Top SHAP Feature Importance')
-                    fig_imp.update_layout(template='plotly_white', height=450)
-                    st.plotly_chart(fig_imp, use_container_width=True, key=f"shap_imp_{key_suffix}")
+                    if shap_imp_df is not None and not shap_imp_df.empty:
+                        sub1, sub2 = st.tabs(["📋 Table", "📊 Chart"])
+                        with sub1:
+                            st.dataframe(shap_imp_df)
+                            if cache_for_pdf is not None:
+                                cache_for_pdf[key_suffix]["metrics"]["SHAP Table"] = shap_imp_df
+                        with sub2:
+                            fig_imp = px.bar(
+                                shap_imp_df.head(20),
+                                x='Importance',
+                                y='Feature',
+                                orientation='h',
+                                title=f'{key_suffix} - Top SHAP Feature Importance' 
+                            )
+                            fig_imp.update_layout(template='plotly_white', height=450)
+                            st.plotly_chart(fig_imp, use_container_width=True)
+                            if cache_for_pdf is not None:
+                                cache_for_pdf[key_suffix]["figs"]["SHAP Feature Importance"] = fig_imp
 
                 # Waterfall Plot
                 with shap_tabs[2]:
@@ -1063,321 +1274,273 @@ def run_xai_analysis(model, X_train, X_test, y_test, methods, key_suffix,
                         else explainer.expected_value[0]
                     )
                     fig_w = px.bar(df_w, x='SHAP', y='Feature', orientation='h',
-                                   title=f'SHAP Waterfall – Instance {idx_w}', color='SHAP')
+                                   title=f'{key_suffix} - SHAP Waterfall (Instance {idx_w})', color='SHAP') 
                     fig_w.update_layout(template='plotly_white', height=450)
-                    st.plotly_chart(fig_w, use_container_width=True, key=f"shap_waterfall_{key_suffix}")
+                    st.plotly_chart(fig_w, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"][f"SHAP Waterfall {idx_w}"] = fig_w
 
-                # ⚡ Force Plot
+                # Force Plot
                 with shap_tabs[3]:
                     idx_f = st.number_input('Select Instance for Force Plot', 0, len(X_shap)-1, 0,
                                             key=f'shap_force_idx_{key_suffix}')
-
                     vals = shap_values.values if hasattr(shap_values, 'values') else shap_values
                     if isinstance(vals, list):
                         vals = np.array(vals[0])
                     if vals.ndim == 3:
                         vals = vals[0]
-
                     instance_shap = vals[idx_f]
                     base_val = explainer.expected_value
                     if isinstance(base_val, (list, np.ndarray)):
                         base_val = float(base_val[0])
-
                     force_plot = shap.force_plot(
                         base_val,
                         instance_shap,
                         X_shap.iloc[idx_f, :],
                         matplotlib=False
                     )
+                    st.write(f"**Model:** {key_suffix}") 
                     st_shap(force_plot, height=300)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"][f"SHAP Force Plot {idx_f}"] = force_plot
 
             except Exception as e: st.error(f'SHAP Error: {e}')
 
     # -------------------- PFI --------------------
     if 'PFI' in methods:
         with xai_tabs[methods.index('PFI')]:
-            st.markdown('## 🚀 Permutation Feature Importance (PFI)')
+            st.markdown(f'## 🚀 PFI - {key_suffix}')
             try:
-                r = permutation_importance(estimator, X_test, y_test, n_repeats=15, random_state=42, n_jobs=-1)
+                r = permutation_importance(
+                    estimator, X_test, y_test,
+                    n_repeats=15,
+                    random_state=42,
+                    n_jobs=-1
+                )
                 idx = r.importances_mean.argsort()[::-1]
-                pfi_imp_df = pd.DataFrame({'Feature': X_test.columns[idx], 'Importance': r.importances_mean[idx],
-                                           'Std Dev': r.importances_std[idx]})
-                st.dataframe(pfi_imp_df)
-                fig_pfi = px.bar(pfi_imp_df.head(20), x='Importance', y='Feature',
-                                 orientation='h', error_x='Std Dev', title='Top 20 PFI Features')
-                fig_pfi.update_layout(template='plotly_white', height=450)
-                st.plotly_chart(fig_pfi, use_container_width=True, key=f"pfi_{key_suffix}")
-            except Exception as e: st.error(f'PFI Error: {e}')
+                pfi_imp_df = pd.DataFrame({
+                    'Feature': X_test.columns[idx],
+                    'Importance': r.importances_mean[idx],
+                    'Std Dev': r.importances_std[idx]
+                })
+
+                tab_table, tab_bar, tab_box, tab_errorbar = st.tabs([
+                    "📋 Table", "📊 Bar Chart", "📉 Boxplot", "📈 Error Bars"
+                ])
+
+                with tab_table:
+                    st.dataframe(pfi_imp_df)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["metrics"]["PFI Table"] = pfi_imp_df
+
+                with tab_bar:
+                    fig_pfi = px.bar(
+                        pfi_imp_df.head(20),
+                        x='Importance',
+                        y='Feature',
+                        orientation='h',
+                        error_x='Std Dev',
+                        title=f'{key_suffix} - Top 20 PFI Features' 
+                    )
+                    fig_pfi.update_layout(template='plotly_white', height=450)
+                    st.plotly_chart(fig_pfi, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"]["PFI Bar"] = fig_pfi
+
+                with tab_box:
+                    fig_box = px.box(
+                        r.importances.T[:, idx][:, :20],
+                        labels={'variable': 'Feature', 'value': 'Importance'},
+                        title=f'{key_suffix} - PFI Distribution' 
+                    )
+                    fig_box.update_layout(
+                        template='plotly_white',
+                        height=500,
+                        xaxis=dict(
+                            tickvals=list(range(20)),
+                            ticktext=list(pfi_imp_df['Feature'].head(20))
+                        )
+                    )
+                    st.plotly_chart(fig_box, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"]["PFI Boxplot"] = fig_box
+
+                with tab_errorbar:
+                    fig_err = px.scatter(
+                        pfi_imp_df.head(20),
+                        x='Importance',
+                        y='Feature',
+                        error_x='Std Dev',
+                        title=f'{key_suffix} - PFI Importance ± Std Dev' 
+                    )
+                    fig_err.update_traces(mode='markers')
+                    fig_err.update_layout(template='plotly_white', height=500)
+                    st.plotly_chart(fig_err, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"]["PFI Error Bars"] = fig_err
+
+            except Exception as e:
+                st.error(f'PFI Error: {e}')
 
     # -------------------- LIME --------------------
     if 'LIME' in methods:
         with xai_tabs[methods.index('LIME')]:
-            st.markdown('## 💡 LIME Local Explanations (with aggregated table)')
+            st.markdown(f'## 💡 LIME - {key_suffix}')
             try:
                 explainer_lime = lime_tabular.LimeTabularExplainer(
-                    X_train.values, feature_names=X_train.columns.tolist(),
-                    mode='regression', discretize_continuous=True, verbose=False
+                    X_train.values,
+                    feature_names=X_train.columns.tolist(),
+                    mode='regression',
+                    discretize_continuous=True,
+                    verbose=False
                 )
-                idx = st.number_input('Select Test Instance', 0, len(X_test)-1, 0, key=f'lime_idx_{key_suffix}')
-                exp = explainer_lime.explain_instance(X_test.iloc[idx].values,
-                                                      lambda x:model.predict(x),
-                                                      num_features=lime_num_features)
-                if components is not None:
-                    components.html(exp.as_html(), height=450, scrolling=True)
-                else:
-                    st.write(exp.as_list())
-            except Exception as e: st.error(f'LIME Error: {e}')
 
-    # -------------------- Anchor Explanations --------------------
-    if 'Anchor' in methods:
-        with xai_tabs[methods.index('Anchor')]:
-            st.markdown("## 🪝 Anchor Explanations (PRO Edition)")
+                # ---------- Single Instance ----------
+                idx = st.number_input(
+                    'Select Test Instance',
+                    0, len(X_test)-1, 0,
+                    key=f'lime_idx_{key_suffix}'
+                )
+                exp = explainer_lime.explain_instance(
+                    X_test.iloc[idx].values,
+                    lambda x: model.predict(x),
+                    num_features=lime_num_features
+                )
+                lime_df = pd.DataFrame(exp.as_list(), columns=['feature', 'LIME Score'])
+                lime_df['Percentage Importance LIME'] = (
+                    lime_df['LIME Score'].abs() / lime_df['LIME Score'].abs().sum()
+                ) * 100
 
-            try:
-                from alibi.explainers import AnchorTabular
-            except ImportError:
-                st.error("`alibi` library is missing. Install with `pip install alibi`.")
-            else:
-                try:
-                    feature_names = X_train.columns.tolist()
-                    X_train_np = X_train.values
-                    X_test_np = X_test.values
+                lime_tabs = st.tabs([
+                    "🔍 Instance Explanation", 
+                    "📄 Contribution Table", 
+                    "📊 Bar Chart", 
+                    "🐝 Multi-Instance Summary"
+                ])
 
-                    predict_fn = lambda x: estimator.predict(x)
+                # ---------- Instance Explanation ----------
+                with lime_tabs[0]:
+                    st.caption(f"LIME Explanation for Model: {key_suffix}")
+                    if components is not None:
+                        components.html(exp.as_html(), height=450, scrolling=True)
+                    else:
+                        st.write(exp.as_list())
 
-                    explainer_anchor = AnchorTabular(
-                        predict_fn,
-                        feature_names=feature_names
-                    )
-                    explainer_anchor.fit(X_train_np)
-
-                    idx = st.number_input(
-                        "Select Test Instance for Anchor",
-                        0, len(X_test_np) - 1, 0,
-                        key=f"anchor_idx_{key_suffix}"
-                    )
-
-                    exp = explainer_anchor.explain(X_test_np[int(idx)])
-                    anchor_rules = list(exp.anchor)
-
-                    st.success(f"Anchor Rules Found: {anchor_rules}")
-                    # ============================================================
-                    # SUB-TAB STRUCTURE
-                    # ============================================================
-                    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-                        [
-                            "📌 Anchor Rules",
-                            "🌊 Precision & Coverage (Liquid Gauge)",
-                            "📈 Local Prediction + 3D Heatmap",
-                            "🌳 Decision Rule Tree",
-                            "📡 Neighborhood Stats"
-                        ]
-                    )
-                    # ============================================================
-                    # TAB 1 — Anchor Rules (Treemap + Bar)
-                    # ============================================================
-                    with tab1:
-                        df_anchor = pd.DataFrame({
-                            "Rule": anchor_rules,
-                            "Weight": [1.0] * len(anchor_rules)
-                        })
-
-                        st.markdown("### 📌 Anchor Rule Structure")
-
-                        c1, c2 = st.columns(2)
-
-                        with c1:
-                            fig_tree = px.treemap(
-                                df_anchor,
-                                path=["Rule"],
-                                values="Weight",
-                                title="Anchor Rule Treemap"
-                            )
-                            fig_tree.update_layout(height=450)
-                            st.plotly_chart(fig_tree, use_container_width=True)
-
-                        with c2:
-                            fig_bar = px.bar(
-                                df_anchor,
-                                x="Weight",
-                                y="Rule",
-                                orientation="h",
-                                title="Anchor Rule Strength"
-                            )
-                            fig_bar.update_layout(template="plotly_white", height=450)
-                            st.plotly_chart(fig_bar, use_container_width=True)
-                    # ============================================================
-                    # TAB 2 — Precision & Coverage Liquid Gauges
-                    # ============================================================
-                    with tab2:
-
-                        st.markdown("### 🌊 Liquid Gauge Visualization")
-
-                        def liquid_gauge(value, title):
-                            fig = {
-                                "data": [{
-                                    "type": "pie",
-                                    "values": [value, 1 - value],
-                                    "labels": ["Value", ""],
-                                    "hole": 0.7,
-                                    "textinfo": "none"
-                                }],
-                                "layout": {
-                                    "title": {"text": f"{title}: {value:.2f}", "x": 0.5},
-                                    "showlegend": False,
-                                }
-                            }
-                            return fig
-
-                        col1, col2 = st.columns(2)
-
-                        with col1:
-                            st.plotly_chart(liquid_gauge(exp.precision, "Precision"), use_container_width=True)
-
-                        with col2:
-                            st.plotly_chart(liquid_gauge(exp.coverage, "Coverage"), use_container_width=True)
-                    # ============================================================
-                    # TAB 3 — Prediction + 3D Heatmap
-                    # ============================================================
-                    with tab3:
-                        pred_val = float(estimator.predict(X_test_np[[int(idx)]]))
-                        act_val = float(y_test.iloc[int(idx)])
-
-                        st.markdown("### 📈 Prediction Overview")
-                        c1, c2 = st.columns(2)
-                        c1.metric("Predicted Value", f"{pred_val:.4f}")
-                        c2.metric("Actual Value", f"{act_val:.4f}")
-
-                        st.markdown("### 🔥 3D Feature Heatmap")
-
-                        df_feat = pd.DataFrame(
-                            X_test_np[int(idx)].reshape(1, -1),
-                            columns=feature_names
+                # ---------- Professional Contribution Table ----------
+                with lime_tabs[1]:
+                    fig_table = go.Figure(data=[go.Table(
+                        header=dict(
+                            values=["Feature", "LIME Score", "% Importance"],
+                            fill_color='darkslategray',
+                            font=dict(color='white', size=14),
+                            align='left'
+                        ),
+                        cells=dict(
+                            values=[
+                                lime_df['feature'],
+                                np.round(lime_df['LIME Score'], 4),
+                                np.round(lime_df['Percentage Importance LIME'], 2)
+                            ],
+                            fill_color='lavender',
+                            align='left',
+                            font=dict(color='black', size=12)
                         )
+                    )])
+                    st.plotly_chart(fig_table, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["metrics"]["LIME Table"] = lime_df
 
-                        fig3d = go.Figure(data=[go.Surface(
-                            z=[df_feat.values[0]],
-                            x=list(range(len(feature_names))),
-                            y=[0] * len(feature_names)
-                        )])
+                # ---------- Enhanced Bar Chart ----------
+                with lime_tabs[2]:
+                    fig_bar = px.bar(
+                        lime_df.sort_values("LIME Score", ascending=True),
+                        x="LIME Score",
+                        y="feature",
+                        orientation="h",
+                        color="LIME Score",
+                        color_continuous_scale=px.colors.diverging.RdBu,
+                        color_continuous_midpoint=0,
+                        title=f"{key_suffix} - LIME Feature Contributions",
+                        labels={"feature": "Feature", "LIME Score": "Score"},
+                        height=500
+                    )
+                    fig_bar.update_layout(
+                        title_font=dict(size=18, family="Arial, bold"),
+                        yaxis=dict(tickfont=dict(size=12)),
+                        xaxis=dict(tickfont=dict(size=12))
+                    )
+                    fig_bar.update_traces(
+                        hovertemplate="<b>%{y}</b><br>LIME Score: %{x:.4f}<br>% Importance: %{customdata[0]:.2f}%",
+                        customdata=np.stack((lime_df['Percentage Importance LIME'],), axis=-1)
+                    )
+                    st.plotly_chart(fig_bar, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"]["LIME Bar"] = fig_bar
 
-                        fig3d.update_layout(
-                            title="3D Heatmap of Feature Values",
-                            scene=dict(
-                                xaxis_title="Feature Index",
-                                yaxis_title="Instance",
-                                zaxis_title="Value"
-                            ),
-                            height=550
+                # ---------- Multi-instance Summary (Heatmap or Beeswarm) ----------
+                with lime_tabs[3]:
+                    st.caption(f"Multi-instance LIME Summary for {key_suffix}")
+                    num_instances = min(50, len(X_test))  # Çok büyükse sınırla
+                    lime_summary = []
+
+                    for i in range(num_instances):
+                        exp_i = explainer_lime.explain_instance(
+                            X_test.iloc[i].values,
+                            lambda x: model.predict(x),
+                            num_features=len(X_train.columns)
                         )
+                        temp_df = pd.DataFrame(exp_i.as_list(), columns=['feature', 'LIME Score'])
+                        temp_df['Instance'] = i
+                        lime_summary.append(temp_df)
 
-                        st.plotly_chart(fig3d, use_container_width=True)
-                    # ============================================================
-                    # TAB 4 — Decision Rule Tree
-                    # ============================================================
-                    with tab4:
-                        st.markdown("### 🌳 Decision Rule Tree (Anchor Logic)")
+                    lime_summary_df = pd.concat(lime_summary, ignore_index=True)
 
-                        rule_tree_text = ""
-                        for i, r in enumerate(anchor_rules):
-                            rule_tree_text += f"{' ' * (i*3)}└── {r}\n"
+                    summary_plot_type = st.radio(
+                        "Select Multi-instance Summary Plot Type",
+                        options=["Heatmap", "Beeswarm"],
+                        index=0,
+                        key=f"multi_lime_plot_{key_suffix}"
+                    )
 
-                        st.code(rule_tree_text, language="text")
-                    # ============================================================
-                    # TAB 5 — Neighborhood Stats
-                    # ============================================================
-                    with tab5:
-                        st.markdown("### 📡 Neighborhood Precision & Coverage")
-
-                        df_nei = pd.DataFrame({
-                            "Metric": ["Precision", "Coverage"],
-                            "Value": [exp.precision, exp.coverage]
-                        })
-
-                        fig_ns = px.bar(
-                            df_nei,
-                            x="Metric",
-                            y="Value",
-                            text="Value",
-                            title="Anchor Neighborhood Performance"
+                    if summary_plot_type == "Heatmap":
+                        heatmap_data = lime_summary_df.pivot(index='feature', columns='Instance', values='LIME Score')
+                        fig_heatmap = px.imshow(
+                            heatmap_data,
+                            color_continuous_scale='RdBu',
+                            aspect='auto',
+                            origin='lower',
+                            labels=dict(x="Instance", y="Feature", color="LIME Score"),
+                            title=f"{key_suffix} - Multi-instance LIME Heatmap"
                         )
-                        fig_ns.update_layout(template="plotly_white", height=450)
-                        st.plotly_chart(fig_ns, use_container_width=True)
+                        fig_heatmap.update_layout(height=600, width=900)
+                        st.plotly_chart(fig_heatmap, use_container_width=True)
 
-                except Exception as e:
-                    st.error(f"Anchor Error: {e}")
+                    elif summary_plot_type == "Beeswarm":
+                        fig_beeswarm = px.strip(
+                            lime_summary_df,
+                            x="LIME Score",
+                            y="feature",
+                            color="LIME Score",
+                            color_continuous_scale='RdBu',
+                            hover_data=["Instance"],
+                            title=f"{key_suffix} - Multi-instance LIME Beeswarm",
+                            orientation='h'
+                        )
+                        fig_beeswarm.update_layout(
+                            height=600,
+                            width=900,
+                            yaxis=dict(categoryorder='total ascending')
+                        )
+                        st.plotly_chart(fig_beeswarm, use_container_width=True)
 
-    # -------------------- Counterfactual Explanations --------------------
+            except Exception as e:
+                st.error(f"LIME Error: {e}")
+
+    # -------------------- Counterfactual --------------------
     if 'Counterfactual' in methods:
         with xai_tabs[methods.index('Counterfactual')]:
-            st.markdown("## 🔄 Counterfactual Explanations (Advanced XAI Panel)")
-
+            st.markdown(f"## 🔄 Counterfactual - {key_suffix}")
             try:
-
-                # 1️⃣ Is y_train available? If not create outcome automatically
-                if 'y_train' in globals():
-                    df_dice = pd.concat([X_train.reset_index(drop=True),
-                                        y_train.reset_index(drop=True)], axis=1)
-                    outcome_col = y_train.name
-                else:
-                    outcome_col = "target"
-                    df_dice = X_train.copy()
-                    df_dice[outcome_col] = estimator.predict(X_train)
-
-                # 2️⃣ Is model classification or regression?
-                is_classification = False
-                try:
-                    _ = estimator.predict_proba(X_test[:5])
-                    is_classification = True
-                except:
-                    is_classification = False
-
-                # 3️⃣ DiCE Data wrapper
-                data_dice = dice_ml.Data(
-                    dataframe=df_dice,
-                    continuous_features=X_train.columns.tolist(),
-                    outcome_name=outcome_col
-                )
-
-                # 4️⃣ Model wrapper
-                if is_classification:
-                    model_dice = dice_ml.Model(model=estimator, backend="sklearn")
-                else:
-                    model_dice = dice_ml.Model(model=estimator,
-                                            backend="sklearn",
-                                            model_type="regressor")
-
-                # 5️⃣ CF engine
-                exp = dice_ml.Dice(data_dice, model_dice, method="random")
-
-                # 6️⃣ Select instance
-                idx = st.number_input(
-                    "Select Test Instance",
-                    0, len(X_test) - 1, 0,
-                    key=f"cf_idx_{key_suffix}"
-                )
-                x0 = X_test.iloc[[idx]]
-                y0 = estimator.predict(x0)[0]
-
-                # 7️⃣ If Regression use desired_range
-                if not is_classification:
-                    delta = abs(y0) * 0.2 if y0 != 0 else 1
-                    desired_range = [y0 - delta, y0 + delta]
-                    cf = exp.generate_counterfactuals(
-                        x0, total_CFs=3, desired_range=desired_range
-                    )
-                else:
-                    cf = exp.generate_counterfactuals(
-                        x0, total_CFs=3, desired_class="opposite"
-                    )
-
-                cf_df = cf.cf_examples_list[0].final_cfs_df
-                original_df = x0.copy()
-                original_df["type"] = "Original"
-                cf_df["type"] = "CF"
-                merged_df = pd.concat([original_df, cf_df], ignore_index=True)
-
-                # 8️⃣ SUB-TABS: Tabular, Heatmap, Radar, Minimal Change, Prediction Plot
                 tab1, tab2, tab3, tab4, tab5 = st.tabs([
                     "📄 Tabular View",
                     "📊 Difference Heatmap",
@@ -1386,257 +1549,467 @@ def run_xai_analysis(model, X_train, X_test, y_test, methods, key_suffix,
                     "📈 CF Prediction Plot"
                 ])
 
-                # 📄 Tab 1: Counterfactual Table
+                idx = st.number_input("Select Test Instance", 0, len(X_test)-1, 0,
+                                    key=f"cf_idx_{key_suffix}")
+                x0 = X_test.iloc[[idx]].copy()
+                y0 = estimator.predict(x0)[0]
+                delta = abs(y0)*0.2 if y0 != 0 else 1
+
+                df_dice = X_train.copy()
+                outcome_col = "target"  
+                df_dice[outcome_col] = estimator.predict(X_train)
+
+                data_dice = dice_ml.Data(
+                    dataframe=df_dice,
+                    continuous_features=X_train.columns.tolist(),
+                    outcome_name=outcome_col
+                )
+                model_dice = dice_ml.Model(model=estimator, backend="sklearn", model_type="regressor")
+                exp_cf = dice_ml.Dice(data_dice, model_dice, method="random")
+
+                desired_range = [y0 - delta, y0 + delta]
+
+                cf = exp_cf.generate_counterfactuals(
+                    x0,
+                    total_CFs=3,
+                    desired_range=desired_range
+                )
+                cf_df = cf.cf_examples_list[0].final_cfs_df.copy()
+
+                if "type" not in cf_df.columns:
+                    cf_df["type"] = "CF"
+                original_df = x0.copy()
+                original_df["type"] = "Original"
+                
                 with tab1:
-                    st.subheader("📄 Counterfactual Table")
                     st.dataframe(cf_df)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["metrics"]["Counterfactual Table"] = cf_df
 
-                # 📊 Tab 2: Difference Heatmap
+                cols_to_drop = ['type', outcome_col]
+                cf_features = cf_df.drop(columns=cols_to_drop, errors='ignore')
+
                 with tab2:
-                    st.subheader("📊 Feature Differences (Original vs CF)")
-                    diff = cf_df[X_train.columns] - x0.values
-                    diff_df = diff.T.rename(columns={0: "Difference"})
-                    fig_diff = px.imshow(
-                        diff_df,
-                        color_continuous_scale="RdBu",
-                        title="Original – Counterfactual Feature Differences",
-                    )
+                    diff = cf_features.subtract(x0.values[0])
+                    fig_diff = px.imshow(diff.T, text_auto=True, aspect="auto",
+                                        labels=dict(x="CF Instance", y="Feature", color="Difference"),
+                                        title=f"{key_suffix} - Feature Difference Heatmap") 
                     st.plotly_chart(fig_diff, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"]["CF Heatmap"] = fig_diff
 
-                # 🧭 Tab 3: Radar Plot
                 with tab3:
-                    st.subheader("🧭 Feature Change Radar Chart")
-                    feat = X_train.columns.tolist()
-                    base_vals = x0.values.flatten()
-                    cf_vals = cf_df.iloc[0][feat].values
-                    fig_radar = go.Figure()
-                    fig_radar.add_trace(go.Scatterpolar(
-                        r=base_vals,
-                        theta=feat,
-                        fill='toself',
-                        name='Original'
-                    ))
-                    fig_radar.add_trace(go.Scatterpolar(
-                        r=cf_vals,
-                        theta=feat,
-                        fill='toself',
-                        name='Counterfactual'
-                    ))
-                    fig_radar.update_layout(
-                        polar=dict(radialaxis=dict(visible=True)),
-                        showlegend=True,
-                        title="Original vs Counterfactual Radar Comparison"
-                    )
-                    st.plotly_chart(fig_radar, use_container_width=True)
+                    fig_radar_cf = px.line_polar(cf_features.T,
+                                                r=cf_features.T.values.flatten(),
+                                                theta=cf_features.T.index.repeat(cf_features.shape[0]),
+                                                line_close=True, title=f"{key_suffix} - CF Radar Plot") 
+                    st.plotly_chart(fig_radar_cf, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"]["CF Radar"] = fig_radar_cf
 
-                # 🔧 Tab 4: Minimal Feature Change
                 with tab4:
-                    st.subheader("🔧 Minimal Feature Changes")
-                    change_df = pd.DataFrame({
-                        "Feature": feat,
-                        "Original": base_vals,
-                        "Counterfactual": cf_vals,
-                        "Difference": cf_vals - base_vals
-                    }).sort_values(by="Difference", key=abs, ascending=False)
-                    st.dataframe(change_df)
+                    min_change = (cf_features - x0.values).abs().min(axis=1)
+                    fig_min = px.bar(x=[f"CF{i}" for i in range(len(min_change))], y=min_change,
+                                    title=f"{key_suffix} - Minimal Feature Change per CF") 
+                    st.plotly_chart(fig_min, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"]["CF Min Change"] = fig_min
 
-                # 📈 Tab 5: CF Prediction Plot
                 with tab5:
-                    st.subheader("📈 Original vs CF Prediction")
-                    y_orig = estimator.predict(x0)
-                    y_cf = estimator.predict(cf_df[feat])
-                    fig_pred = go.Figure()
-                    fig_pred.add_trace(go.Bar(name='Original', x=[0], y=[y_orig[0]]))
-                    fig_pred.add_trace(go.Bar(name='Counterfactual', x=[0], y=[y_cf[0]]))
-                    fig_pred.update_layout(title="Predicted Values Comparison", showlegend=True)
+                    pred_vals = estimator.predict(cf_features)
+                    fig_pred = px.bar(x=[f"CF{i}" for i in range(len(pred_vals))], y=pred_vals,
+                                    title=f"{key_suffix} - Counterfactual Predictions") 
                     st.plotly_chart(fig_pred, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"]["CF Predictions"] = fig_pred
 
             except Exception as e:
                 st.error(f"Counterfactual Error: {e}")
+
+    # -------------------- Anchor --------------------
+    if 'Anchor' in methods:
+        with xai_tabs[methods.index('Anchor')]:
+            st.markdown(f"## 🪝 Anchor - {key_suffix}")
+            try:
+                from alibi.explainers import AnchorTabular
+                feature_names = X_train.columns.tolist()
+                X_train_np = X_train.values
+                X_test_np = X_test.values
+                predict_fn = lambda x: estimator.predict(x)
+
+                explainer_anchor = AnchorTabular(predict_fn, feature_names=feature_names)
+                explainer_anchor.fit(X_train_np)
+
+                idx = st.number_input(
+                    "Select Test Instance for Anchor",
+                    0, len(X_test_np)-1, 0,
+                    key=f"anchor_idx_{key_suffix}"
+                )
+                exp_anchor = explainer_anchor.explain(X_test_np[int(idx)])
+                anchor_rules = list(exp_anchor.anchor)
+
+                tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                    "📌 Anchor Rules", "🌊 Precision & Coverage", "📈 3D Heatmap",
+                    "🌳 Decision Tree", "📡 Neighborhood Stats"
+                ])
+
+                with tab1:
+                    st.write(anchor_rules)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["metrics"]["Anchor Rules"] = anchor_rules
+
+                with tab2:
+                    st.metric("Precision", exp_anchor.precision)
+                    st.metric("Coverage", exp_anchor.coverage)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["metrics"]["Anchor Precision"] = exp_anchor.precision
+                        cache_for_pdf[key_suffix]["metrics"]["Anchor Coverage"] = exp_anchor.coverage
+
+                with tab3:
+                    y_pred = estimator.predict(X_test_np)
+                    fig_heat = px.scatter_3d(
+                        x=X_test_np[:,0], y=X_test_np[:,1], z=y_pred,
+                        color=y_pred, title=f"{key_suffix} - Local Predictions 3D Heatmap" 
+                    )
+                    st.plotly_chart(fig_heat, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"]["Anchor Heatmap"] = fig_heat
+
+                with tab4:
+                    if hasattr(estimator, 'estimators_'):
+                        tree = estimator.estimators_[0].tree_
+                        fig_tree = px.treemap(
+                            pd.DataFrame({
+                                "Feature": [feature_names[i] if i >= 0 else "Leaf" for i in tree.feature],
+                                "Samples": tree.n_node_samples
+                            }),
+                            path=["Feature"], values="Samples",
+                            title=f"{key_suffix} - Decision Tree Treemap" 
+                        )
+                    elif hasattr(estimator, 'tree_'):
+                        tree = estimator.tree_
+                        fig_tree = px.treemap(
+                            pd.DataFrame({
+                                "Feature": [feature_names[i] if i >= 0 else "Leaf" for i in tree.feature],
+                                "Samples": tree.n_node_samples
+                            }),
+                            path=["Feature"], values="Samples",
+                            title=f"{key_suffix} - Decision Tree Treemap" 
+                        )
+                    else:
+                        st.info("Decision tree visualization not available for this model.")
+                        fig_tree = None
+
+                    if fig_tree is not None:
+                        st.plotly_chart(fig_tree, use_container_width=True)
+                        if cache_for_pdf is not None:
+                            cache_for_pdf[key_suffix]["figs"]["Anchor Tree"] = fig_tree
+
+                with tab5:
+                    mask = np.ones(len(X_train), dtype=bool)
+                    for rule in anchor_rules:
+                        parts = rule.split(" ")
+                        if len(parts) == 3 and parts[1] in ['<=','>']:
+                            f, op, val = parts
+                            val = float(val)
+                            if op == "<=":
+                                mask &= X_train[f] <= val
+                            else:
+                                mask &= X_train[f] > val
+                    neigh_df = X_train[mask]
+                    st.dataframe(neigh_df.head(20))
+
+                    fig_neigh = px.histogram(neigh_df, x=feature_names[0], nbins=20,
+                                            title=f"{key_suffix} - Neighborhood of '{feature_names[0]}'") 
+                    st.plotly_chart(fig_neigh, use_container_width=True)
+                    if cache_for_pdf is not None:
+                        cache_for_pdf[key_suffix]["figs"]["Anchor Neighborhood"] = fig_neigh
+
+            except Exception as e:
+                st.error(f"Anchor Error: {e}")
 
     # -------------------- Radar Chart --------------------
     if ('PFI' in methods or 'SHAP' in methods):
         try:
             with st.expander('📡 Combined Radar'):
-                fig_radar = create_combined_radar(pfi_imp_df if pfi_imp_df is not None else pd.DataFrame({'Feature':[], 'Importance':[]}), shap_imp_df, top_k=radar_top_k)
-                st.plotly_chart(fig_radar, use_container_width=True, key=f"radar_{key_suffix}")
-        except Exception as e: st.error(f'Radar Error: {e}')
+                fig_radar = create_combined_radar(
+                    pfi_imp_df if pfi_imp_df is not None else pd.DataFrame({'Feature':[], 'Importance':[]}), 
+                    shap_imp_df, 
+                    top_k=radar_top_k,
+                    title=f"{key_suffix} - PFI + SHAP Radar" 
+                )
+                st.plotly_chart(fig_radar, use_container_width=True)
+                if cache_for_pdf is not None:
+                    cache_for_pdf[key_suffix]["figs"]["Combined Radar"] = fig_radar
+        except Exception as e:
+            st.error(f'Radar Error: {e}')
 
-    return {'pfi': pfi_imp_df, 'shap': shap_imp_df}
-
+# ---------------------------
+# RUN DASHBOARD
+# ---------------------------
 def run_dashboard(results, selected_diag_plots, xai_ops):
     if not results:
         st.info("👈 Upload data & Start Training.")
         return
     
+    cached_diagnostics = {} 
+
+    # ------------------ Leaderboard ------------------
     with st.expander("### 🏆 Leaderboard", expanded=False):
         lb_tabs = st.tabs(["📋 Table", "📈 Chart", "⚙️ Parameters"])
         
-# --- TABLE GENERATION ---
+        # Prepare Table Data
         table_data = []
         for k, v in results.items():
             row = v['metrics'].copy()
             row['Model'] = v.get('base_model', k) 
             row['Processing'] = v.get('proc_info', '-')
             table_data.append(row)
-            
         df_res = pd.DataFrame(table_data)
         
-        cols = ['Model', 'Processing'] + [c for c in df_res.columns if c not in ['Model', 'Processing']]
-        df_res = df_res[cols]
-        
+        # Reorder columns safely
+        base_cols = ['Model', 'Processing']
+        other_cols = [c for c in df_res.columns if c not in base_cols]
+        df_res = df_res[base_cols + other_cols]
+
+        # --- TAB 1: TABLE---
         with lb_tabs[0]:
-            st.dataframe(df_res.style.format(precision=4).highlight_min(subset=["MSE","RMSE"], color='lightblue').highlight_max(subset=["R2"], color='red'), use_container_width=True)
+            numeric_cols = df_res.select_dtypes(include=[np.number]).columns.tolist()
+            
+            hl_min_cols = [c for c in ["MSE", "RMSE", "MAE", "MAPE"] if c in df_res.columns]
+            hl_max_cols = [c for c in ["R2", "Adj_R2"] if c in df_res.columns]
 
-        # --- Tab 2: Chart  ---
+            st_style = df_res.style.format(subset=numeric_cols, precision=4)
+            
+            if hl_min_cols:
+                st_style = st_style.highlight_min(subset=hl_min_cols, color='#d9f2d9') # Light Green
+            if hl_max_cols:
+                st_style = st_style.highlight_max(subset=hl_max_cols, color='#ffcccc') # Light Red
+
+            st.dataframe(st_style, use_container_width=True)
+
+        # --- TAB 2: CHART ---
         with lb_tabs[1]:
-            df_res = pd.DataFrame([{**{'Model': k}, **v['metrics']} for k, v in results.items()])
-
+            df_chart = pd.DataFrame([{**{'Model': k}, **v['metrics']} for k, v in results.items()])
             fig = go.Figure()
+            
+            metrics_to_plot = [col for col in df_chart.columns if col not in ['Model','R2'] and pd.api.types.is_numeric_dtype(df_chart[col])]
+            
+            for metric in metrics_to_plot:
+                text_labels = []
+                for val in df_chart[metric]:
+                    try:
+                        text_labels.append(f"{val:.4f}")
+                    except (ValueError, TypeError):
+                        text_labels.append(str(val))
 
-            metrics_to_plot = [col for col in df_res.columns if col != 'Model' and col != 'R2']
+                fig.add_trace(go.Bar(
+                    x=df_chart['Model'], 
+                    y=df_chart[metric], 
+                    name=metric,
+                    text=text_labels, 
+                    textposition="outside"
+                ))
+            
+            if "R2" in df_chart.columns and pd.api.types.is_numeric_dtype(df_chart["R2"]):
+                fig.add_trace(go.Scatter(x=df_chart['Model'], y=df_chart["R2"], mode='markers+lines', 
+                                         name="R2", line=dict(color='green', dash='dash')))
+            
+            fig.update_layout(title="Leaderboard Metrics", barmode='group', template="plotly_white", height=550)
+            st.plotly_chart(fig, use_container_width=True)
 
-            if not metrics_to_plot and "R2" not in df_res.columns:
-                st.warning("No calculated metrics found to plot.")
-            else:
-
-                for metric in metrics_to_plot:
-                    fig.add_trace(go.Bar(
-                        x=df_res['Model'],
-                        y=df_res[metric],
-                        name=metric,
-                        text=[f"{v:.4f}" for v in df_res[metric]],
-                        textposition="outside",
-                        insidetextanchor="middle",
-                        hovertemplate=f"<b>%{{x}}</b><br>{metric}: %{{y:.4f}}<extra></extra>",
-                        yaxis="y1"
-                    ))
-
-                if "R2" in df_res.columns:
-                    min_size = 12
-                    max_size = 30
-                    r2_min = df_res["R2"].min()
-                    r2_max = df_res["R2"].max()
-                    if r2_max != r2_min:
-                        sizes = min_size + (df_res["R2"] - r2_min) / (r2_max - r2_min) * (max_size - min_size)
-                    else:
-                        sizes = [(min_size + max_size)/2] * len(df_res)
-
-                    fig.add_trace(go.Scatter(
-                        x=df_res['Model'],
-                        y=df_res["R2"],
-                        mode='markers+lines',
-                        marker=dict(
-                            symbol='star',
-                            size=sizes,
-                            color='green',  
-                            line=dict(width=1, color='black')
-                        ),
-                        line=dict(color='green', dash='dash', width=2),
-                        name="R2 Trend",
-                        hovertemplate="<b>%{x}</b><br>R2: %{y:.6f}<extra></extra>",
-                        yaxis="y2"
-                    ))
-
-            # Layout settings
-            fig.update_layout(
-                title="Leaderboard Metrics Comparison (Dual Y-Axis & R² Size)",
-                xaxis=dict(title="Model", tickangle=-45),
-                yaxis=dict(title="Metric Value", side="left"),
-                yaxis2=dict(title="R2 Value", overlaying="y", side="right"),
-                barmode='group',
-                bargap=0.25,
-                bargroupgap=0.1,
-                template="plotly_white",
-                height=550,
-                legend=dict(title="Metrics"),
-                hovermode="x unified"
-            )
-
-            fig.update_traces(textfont_size=10)
-
-            st.plotly_chart(fig, use_container_width=True, key="leaderboard_chart_r2size")
-
-
+        # --- TAB 3: PARAMETERS ---
         with lb_tabs[2]:
             param_list = []
             for m_name, res in results.items():
                 model_obj = res['model']
                 final_model = model_obj.named_steps['model'] if isinstance(model_obj, Pipeline) else model_obj
                 params = final_model.get_params()
-                
                 base_name = m_name.split(' (')[0].strip()
                 row = {"Model": m_name}
                 if base_name in config.MODEL_DEFAULT_PARAMS:
                     for k in config.MODEL_DEFAULT_PARAMS[base_name].keys():
                         if k in params:
                             disp_name = config.UNIFIED_PARAM_NAMES.get(k, k)
-                            
                             val = params[k]
-                            if isinstance(val, (tuple, list)):
-                                row[disp_name] = str(val)
-                            else:
-                                row[disp_name] = val
-                            
+                            row[disp_name] = str(val) if isinstance(val, (list, tuple)) else val
                 param_list.append(row)
-            
             if param_list:
                 st.dataframe(pd.DataFrame(param_list).fillna("-").astype(str), use_container_width=True)
 
+    # ------------------ Model Visualizations ------------------
     with st.expander("### 📊 Visualization"):
         model_tabs = st.tabs(list(results.keys()))
         for i, model_name in enumerate(results.keys()):
             res = results[model_name]
+            # Initialize cache dict for this model
+            cached_diagnostics[model_name] = {"metrics": res['metrics'], "figs": {}}
+            
             with model_tabs[i]:
                 ftab, dtab, xtab = st.tabs(["📉 Forecast", "🔍 Diagnostics", "🧠 XAI"])
-                with ftab:
-                    limit = min(200, len(res['yte']))
-                    df_viz = pd.DataFrame({'Actual': res['yte'].iloc[:limit], 'Predicted': res['ypr'][:limit]})
-                    st.plotly_chart(px.line(df_viz, markers=True, title=f"{model_name} Forecast"), use_container_width=True, key=f"{model_name}_fc")
-                with dtab:
-                    display_diagnostic_plots(res['yte'], res['ypr'], res.get('ytr'), res.get('ytr_pr'), key_prefix=model_name, active_plots=selected_diag_plots)
-                with xtab:
-                    run_xai_analysis(res['model'], res['Xt'], res['Xte'], res['yte'], xai_ops, key_suffix=model_name)
 
+                # ---------- Forecast ----------
+                with ftab:
+                    max_limit = len(res['yte'])
+                    limit = st.slider(f"Select number of points to display for {model_name}",
+                                      min_value=10, max_value=min(500, max_limit), value=min(200, max_limit))
+                    df_viz = pd.DataFrame({'Actual': res['yte'].iloc[:limit], 'Predicted': res['ypr'][:limit]})
+                    fig_fc = px.line(df_viz, markers=True, title=f"{model_name} Forecast",
+                                     labels={'index': 'Index', 'value': 'Value', 'variable': 'Legend'}, template="plotly_white")
+                    fig_fc.update_traces(line=dict(width=3), marker=dict(size=6))
+                    fig_fc.update_layout(legend=dict(title="Series"), xaxis_title="Time/Index", yaxis_title="Value",
+                                         hovermode="x unified", margin=dict(l=40, r=40, t=60, b=40))
+                    st.plotly_chart(fig_fc, use_container_width=True, key=f"{model_name}_fc")
+                    cached_diagnostics[model_name]["figs"]["Forecast"] = fig_fc
+
+                # ---------- Diagnostics ----------
+                with dtab:
+                    display_diagnostic_plots(
+                        res['yte'], res['ypr'], res.get('ytr'), res.get('ytr_pr'),
+                        key_prefix=model_name, active_plots=selected_diag_plots,
+                        cache_for_pdf=cached_diagnostics
+                    )
+
+                # ---------- XAI  ----------
+                with xtab:
+                    run_xai_analysis(
+                        res['model'], 
+                        res['Xt'], 
+                        res['Xte'], 
+                        res['yte'], 
+                        xai_ops, 
+                        key_suffix=model_name,
+                        cache_for_pdf=cached_diagnostics
+                    )
+    # ------------------ Exports ------------------
     with st.expander("### 📥 Exports"):
         c1, c2 = st.columns(2)
         c1.download_button("Download Metrics (CSV)", df_res.to_csv(index=False).encode('utf-8'), "metrics.csv", "text/csv")
         if c2.button("Generate PDF Report"):
             with st.spinner("Generating PDF..."):
                 try:
-                    pdf_data = generate_pdf_report(results, selected_diag_plots, xai_ops)
+                    pdf_data = generate_pdf_report(results, cached_diagnostics)
                     st.download_button("Download PDF", pdf_data, "AutoML_Report.pdf", "application/pdf")
-                except Exception as e: st.error(f"PDF Error: {e}")
+                except Exception as e:
+                    st.error(f"PDF Error: {e}")
 
-def generate_pdf_report(results, active_diag_plots, active_xai_methods):
+# ---------------------------
+# GENERATE PDF REPORT
+# ---------------------------
+def generate_pdf_report(results, cached_diagnostics):
     buf = BytesIO()
+    
     with PdfPages(buf) as pdf:
-        fig = plt.figure(figsize=(8.5, 11))
+        
+        fig_cover = plt.figure(figsize=(11.69, 8.27))
         plt.axis('off')
-        plt.text(0.5, 0.6, config.APP_CONFIG["pdf_title"], ha='center', fontsize=24, fontweight='bold')
-        plt.text(0.5, 0.5, f"Date: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}", ha='center', fontsize=14)
-        pdf.savefig(fig); plt.close()
+        report_title = config.APP_CONFIG.get("pdf_title", "AutoML Professional Report")
+        plt.text(0.5, 0.6, report_title, ha='center', va='center', fontsize=28, fontweight='bold', color='#2E4053')
+        plt.text(0.5, 0.5, f"Date: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}", ha='center', fontsize=14, color='gray')
+        pdf.savefig(fig_cover)
+        plt.close()
 
+        # 2. LEADERBOARD
         if results:
-            dfm = pd.DataFrame([{**{'Model':k}, **v['metrics']} for k,v in results.items()])
-            fig, ax = plt.subplots(figsize=(11, 8.5))
-            ax.axis('tight'); ax.axis('off')
-            table = ax.table(cellText=dfm.round(4).values, colLabels=dfm.columns, loc='center')
-            table.auto_set_font_size(False); table.set_fontsize(8); table.scale(1.0, 1.2)
-            ax.set_title("Leaderboard", fontweight='bold')
-            pdf.savefig(fig); plt.close()
+            dfm = pd.DataFrame([{**{'Model': k}, **v['metrics']} for k, v in results.items()])
+            cols = ['Model'] + [c for c in dfm.columns if c != 'Model']
+            dfm = dfm[cols]
+            numeric_cols = dfm.select_dtypes(include=[np.number]).columns
+            dfm[numeric_cols] = dfm[numeric_cols].round(4)
 
+            fig_lb = plt.figure(figsize=(11.69, 8.27))
+            ax_table = fig_lb.add_subplot(111)
+            ax_table.axis('off')
+            
+            table = ax_table.table(cellText=dfm.values, colLabels=dfm.columns, loc='center', cellLoc='center')
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            table.scale(1.0, 1.2)
+            
+            ax_table.set_title("🏆 Leaderboard Metrics", fontsize=14, fontweight='bold')
+            pdf.savefig(fig_lb)
+            plt.close()
+
+        # 3. MODEL DETAYLARI (Forecast, Diagnostics, XAI)
         for model_name, res in results.items():
-            fig = plt.figure(figsize=(8.5, 11))
-            gs = fig.add_gridspec(3, 1)
-            ax_title = fig.add_subplot(gs[0, :]); ax_title.axis('off')
-            ax_title.text(0.5, 0.5, f"Model: {model_name}", ha='center', fontsize=18, fontweight='bold')
-            ax_fc = fig.add_subplot(gs[1:, :])
-            limit = min(150, len(res['yte']))
-            ax_fc.plot(res['yte'].values[:limit], label='Actual', color='black', alpha=0.7)
-            ax_fc.plot(res['ypr'][:limit], label='Predicted', color='red', linestyle='--', alpha=0.7)
-            ax_fc.legend()
-            pdf.savefig(fig); plt.close()
+            cached = cached_diagnostics.get(model_name, {})
+            figs = cached.get("figs", {})
+            metrics = cached.get("metrics", {})
+
+            # --- A) FORECAST PAGE ---
+            fig_fc_page = plt.figure(figsize=(11.69, 8.27))
+            
+            ax_head = fig_fc_page.add_subplot(211)
+            ax_head.axis('off')
+            ax_head.text(0.5, 0.5, f"Model: {model_name}\nForecast & Analysis", ha='center', va='center', fontsize=20, fontweight='bold', color='#1F618D')
+
+            # Forecast Resmi
+            ax_plot = fig_fc_page.add_subplot(212) 
+            ax_plot.axis('off')
+            
+            if "Forecast" in figs:
+                try:
+                    img_bytes = pio.to_image(figs["Forecast"], format='png', scale=2)
+                    img = mpimg.imread(BytesIO(img_bytes))
+                    ax_plot.imshow(img)
+                except Exception as e:
+                    ax_plot.text(0.5, 0.5, f"Error plotting forecast: {e}", ha='center')
+            
+            pdf.savefig(fig_fc_page)
+            plt.close()
+
+            # --- B) DIAGNOSTIC & XAI PLOTS (Auto Detect Type) ---
+            all_other_figs = [k for k in figs.keys() if k != "Forecast"]
+
+            for fig_name in all_other_figs:
+                fig_obj = figs[fig_name]
+                
+                fig_page = plt.figure(figsize=(11.69, 8.27))
+                ax = fig_page.add_subplot(111)
+                ax.axis('off')
+                ax.set_title(f"{model_name} - {fig_name}", fontsize=14, fontweight='bold', pad=20)
+
+                try:
+                    if hasattr(fig_obj, 'savefig'):
+                        buf_img = BytesIO()
+                        fig_obj.savefig(buf_img, format='png', bbox_inches='tight')
+                        buf_img.seek(0)
+                        img = mpimg.imread(buf_img)
+                        ax.imshow(img)
+                    
+                    elif hasattr(fig_obj, 'write_image') or (isinstance(fig_obj, dict) and 'data' in fig_obj):
+                        img_bytes = pio.to_image(fig_obj, format='png', scale=2)
+                        img = mpimg.imread(BytesIO(img_bytes))
+                        ax.imshow(img)
+                    
+                    else:
+                        ax.text(0.5, 0.5, "Bu grafik formatı (HTML/JS) PDF raporunda desteklenmemektedir.", ha='center', color='gray')
+
+                except Exception as e:
+                    ax.text(0.5, 0.5, f"Görsel oluşturma hatası:\n{str(e)}", ha='center', color='red')
+
+                pdf.savefig(fig_page)
+                plt.close(fig_page)
+
+            # --- C) METRIC TABLES ---
+            for metric_name, df_metric in metrics.items():
+                if isinstance(df_metric, pd.DataFrame):
+                    fig_table = plt.figure(figsize=(11.69, 8.27))
+                    ax = fig_table.add_subplot(111)
+                    ax.axis('off')
+                    
+                    row_count = len(df_metric)
+                    font_size = 10 if row_count < 20 else 6
+                    
+                    cell_text = df_metric.astype(str).values
+                    
+                    table = ax.table(cellText=cell_text, colLabels=df_metric.columns, loc='center', cellLoc='center')
+                    table.auto_set_font_size(False)
+                    table.set_fontsize(font_size)
+                    
+                    ax.set_title(f"{model_name} - {metric_name}", fontsize=14, fontweight='bold')
+                    pdf.savefig(fig_table)
+                    plt.close()
 
     buf.seek(0)
     return buf.read()
@@ -1671,7 +2044,20 @@ st.sidebar.markdown("""
 st.sidebar.header("1️⃣ Data & Preparation")
 
 with st.sidebar.expander("📂 Upload & Select Columns", expanded=False):
-    uploaded_file = st.file_uploader("Upload CSV File", type=['csv'], help="Drag & drop your CSV file here.")
+    uploaded_file = st.file_uploader(
+        "Upload Data File", 
+        type=config.DATA_CONFIG["supported_extensions"],
+        help="""
+        **Supported File Formats:**
+        
+        * **📄 CSV / TXT:** Comma or tab-separated value files. Standard for tabular data.
+        * **📊 XLSX:** Microsoft Excel files. The first sheet will be read.
+        * **🧮 MAT:** MATLAB data files. Must contain 2D matrices/arrays.
+        
+        _Ensure your file contains clean, tabular data._
+        """
+    )
+
     df_raw = None
     feature_cols, target_col, date_col = [], None, None
     outlier_ops, scaler_ops = [], []
@@ -1680,9 +2066,26 @@ with st.sidebar.expander("📂 Upload & Select Columns", expanded=False):
         df_raw = load_data(uploaded_file)
         if df_raw is not None:
             cols = df_raw.columns.tolist()
-            date_col = st.selectbox("📅 Date Column (Optional)", [None] + cols)
-            target_col = st.selectbox("🎯 Target Column", cols, index=len(cols)-1)
-            feature_cols = st.multiselect("🧩 Select Features", [c for c in cols if c != target_col], default=None)
+                
+            date_col = st.selectbox(
+                    "📅 Date Column (Optional)", 
+                    [None] + cols,
+                    help="Select the column containing date/time information. This is required for Time Series Cross-Validation and trend plotting. If data is not time-dependent, leave as 'None'."
+            )
+                
+            target_col = st.selectbox(
+                    "🎯 Target Column", 
+                    cols, 
+                    index=len(cols)-1,
+                    help="The dependent variable (Label/Y) you want to predict. For regression tasks, ensure this column contains continuous numerical values."
+            )
+                
+            feature_cols = st.multiselect(
+                    "🧩 Select Features", 
+                    [c for c in cols if c != target_col], 
+                    default=None,
+                    help="The independent variables (Features/X) used to train the model. Select all relevant columns that influence the target."
+            )
         else:
             st.error("❌ Failed to read the file.")
 
@@ -1722,28 +2125,50 @@ if df_raw is not None and feature_cols:
     with st.sidebar.expander("⚙️ Clean & Scale Data", expanded=False):
 
         st.markdown("### 🩹 Missing Value Imputation")
+        # --- 1. FILLING METHOD ---
         filling_method = st.selectbox(
             "Select Filling Method",
             config.DATA_CONFIG.get("imputation_methods", []),
             index=None,                         
             placeholder="Select a filling method...",
-            help="Mean, Median, Mode or Zero"
+            help="""
+            **Imputation Strategy Guide:**
+            * **Mean:** Fills missing values with the average. Best for normally distributed data without outliers. 
+            [Image of normal vs skewed distribution for imputation]
+            * **Median:** Fills with the middle value. More robust to outliers and skewed data than Mean.
+            * **Mode:** Fills with the most frequent value. Ideal for categorical data or discrete numbers.
+            * **Zero:** Fills with 0. Use only if 'missing' logically implies 'zero quantity' or 'absence'.
+            """
         )
-
+        # --- 2. OUTLIER HANDLING ---
         st.markdown("### 🧹 Outlier Handling")
         outlier_ops = st.multiselect(
             "Choose Outlier Treatment",
             config.DATA_CONFIG.get("outlier_methods", []),
             placeholder="Choose outlier treatments...", 
-            help="IQR Capping, Z-Score Capping or Isolation Forest Drop"
+            help="""
+            **Outlier Treatment Methods:**
+            * **IQR Capping:** Caps values based on the Interquartile Range (25th-75th percentile). Best for skewed data; modifies extreme values to the nearest 'fence'. 
+            [Image of boxplot IQR outlier detection]
+            * **Z-Score Capping:** Caps values that are far from the mean (usually >3 std dev). Assumes data is normally distributed.
+            * **Isolation Forest Drop:** Uses an anomaly detection algorithm to identify and **REMOVE** rows completely. Note: This reduces your dataset size.
+            """
         )
 
+        # --- 3. SCALING METHODS ---
         st.markdown("### 📏 Scaling Methods")
         scaling_ops = st.multiselect(
             "Select Scaling Method",
             config.DATA_CONFIG.get("scaling_methods", []),
             placeholder="Select scaling methods...", 
-            help="MinMax, Standard, Robust, MaxAbs, Log Transformation"
+            help="""
+            **Scaling Techniques:**
+            * **Min-Max (0-1):** Scales data to a fixed range [0, 1]. Preserves distribution shape but sensitive to outliers. Good for Neural Networks.
+            * **Standard (Z-Score):** Centers data around 0 with unit variance. Standard choice for SVM, Linear Regression, and KNN. 
+            * **Robust:** Uses Median and IQR. The best choice if your data contains many outliers.
+            * **MaxAbs:** Scales by dividing by the maximum absolute value. Preserves sparsity (0 remains 0).
+            * **Log Transform:** Applies `log(1+x)` to compress large values. Essential for highly right-skewed data (e.g., income, prices).
+            """
         )
 
         col_apply, col_reset = st.columns(2)
@@ -1793,8 +2218,18 @@ if df_raw is not None and feature_cols:
     st.sidebar.header("3️⃣ Modeling")
 
     with st.sidebar.expander("🧠 Models & Parameters", expanded=False):
-        st.info("Select models from different families below:")
+        st.markdown("### 📚 Model Categories", help="""
+        **Guide to Model Families:**
         
+        * **🌲 Tree & Ensemble:** (e.g. XGBoost, RandomForest) Generally state-of-the-art for tabular data. Captures complex, non-linear patterns.
+        * **📈 Linear & Regularized:** (e.g. Ridge, Lasso) Simple, fast, and interpretable. Great for establishing a baseline.
+        * **🛡️ Bayesian & Robust:** (e.g. RANSAC, BayesianRidge) Excellent for small datasets or data containing many outliers.
+        * **⭕ Support Vector Machines:** (e.g. SVR) Effective in high-dimensional spaces.
+        * **🧠 Neural Networks & Others:** (e.g. MLP, KNN) Captures complex interactions (Neural Nets) or local patterns (Neighbors).
+        """)
+        
+        st.info("Select models from different families below:")
+
         selected_models = []
         
         for group_name, models_in_group in config.MODEL_GROUPS.items():
@@ -1827,32 +2262,71 @@ if df_raw is not None and feature_cols:
         st.markdown("**⚙️ Advanced Settings**")
         hpo_ops = st.multiselect(
             "Hyperparameter Optimization", 
-            ["Random Search","Grid Search"], 
-            help="Automatically find the best parameters."
+            config.AVAILABLE_HPO_METHODS,
+            help="""
+            **Method Comparison:**
+            
+            * **Random Search:** Selects random parameters from the space. Fast and generally provides good results.
+            * **Grid Search:** Tries all possible combinations. The most comprehensive but slowest method.
+            * **Optuna:** Uses the TPE (Tree-structured Parzen Estimator) algorithm. Performs smart search by learning from previous trials.
+            * **Hyperband:** Uses Optuna infrastructure but stops poor-performing runs early (Pruning). Resource-friendly and fast.
+            * **Bayesian Optimization:** Performs statistical optimization using Gaussian Process (GP).
+            """
         )
         metric_ops = st.multiselect(
             "Evaluation Metrics", 
             config.METRICS_CONFIG["available"], 
             default=config.METRICS_CONFIG["defaults"],
-            help="Select metrics to evaluate model performance."
+            help="""
+            **Metric Definitions:**
+            
+            * **MSE (Mean Squared Error):** Average squared difference between actual and predicted values. Heavily penalizes large errors.
+            * **RMSE (Root Mean Squared Error):** Square root of MSE. In the same unit as the target variable; easy to interpret.
+            * **MAE (Mean Absolute Error):** Average absolute difference. Less sensitive to outliers than MSE.
+            * **R2 (R-Squared):** Proportion of variance explained by the model (0 to 1). Higher is better.
+            * **Adj_R2 (Adjusted R2):** R2 adjusted for the number of predictors. Prevents overfitting illusion when adding features.
+            * **MAPE (Mean Absolute Percentage Error):** Average percentage error. Easy to interpret for business stakeholders.
+            * **MedAE (Median Absolute Error):** Median of all absolute errors. Very robust to outliers.
+            * **MaxErr (Max Error):** The largest single error made by the model. Represents the worst-case prediction.
+            * **ExpVar (Explained Variance):** Measures the proportion of variation in the target explained by the model.
+            * **MSLE / RMSLE:** Logarithmic error metrics. Useful when target values span several orders of magnitude or you care about relative error.
+            """
         )
-# -----------------------------
+# -------------------------------------------------------------------------
 # --- SECTION 4: ANALYSIS & XAI ---
-# -----------------------------
+# -------------------------------------------------------------------------
     st.sidebar.header("4️⃣ Analysis & Outputs")
-
     with st.sidebar.expander("📊 Diagnostic Plots & XAI", expanded=False):
+        # --- DIAGNOSTIC PLOTS ---
         selected_diag_plots = st.multiselect(
             "Diagnostic Plots", 
-            config.DIAGNOSTIC_PLOTS, default=config.DIAGNOSTIC_DEFAULTS,
-            help="Visualize model performance."
+            config.DIAGNOSTIC_PLOTS, 
+            default=config.DIAGNOSTIC_DEFAULTS,
+            help="""
+            **Diagnostic Guide:**
+            * **📉 Overfitting Check:** Compares Train vs Test error. Large gap indicates memorization (Overfitting).
+            * **🎯 Advanced Scatter:** Actual vs Predicted values. Points on the diagonal line are perfect predictions.
+            * **〰️ Residuals:** Shows errors (Actual - Predicted). Random scatter is ideal; patterns indicate missed information.
+            * **🔔 Distribution:** Histogram of residuals. Ideally, it should look like a bell curve (Normal Distribution). 
+            [Image of normal vs skewed distribution for imputation]
+            * **📈 QQ Plot:** Checks if errors follow a normal distribution. Points should hug the red line.
+            * **💣 Influence:** Identifies data points that disproportionately 'pull' the model (High Leverage/Cook's D).
+            * **🚨 Anomalies:** Uses Isolation Forest to highlight specific rows where the model failed significantly.
+            """
         )
+        # --- XAI METHODS ---
         xai_ops = st.multiselect(
             "Explainable AI (XAI)", 
             config.XAI_CONFIG["methods"], 
-            help="Understand why the model makes its predictions."
+            help="""
+            **XAI Method Guide:**
+            * **🌈 SHAP:** The 'Gold Standard' based on Game Theory. Shows exactly how much each feature contributed to a specific prediction (Global & Local).
+            * **🚀 PFI (Permutation Importance):** Shuffles a column and checks how much the error increases. Best for finding the most important features overall.
+            * **💡 LIME:** Creates a simple, interpretable model around a *single* data point to explain local decisions.
+            * **⚓ Anchor:** Explains decisions using high-precision "If-Then" rules (e.g., "IF Age < 30 AND Income > 50k THEN...").
+            * **🔄 Counterfactual:** "What-if" analysis. Shows the minimal changes needed to get a different result (e.g., "Increase income by 5k to change prediction").
+            """
         )
-
     train_btn = st.sidebar.button("🚀 Start Analysis", type="primary")
 
     # -------------------------------------------------------------------------
